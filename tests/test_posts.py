@@ -374,7 +374,6 @@ class PostTests(unittest.TestCase):
         live.creator_streams = dict.fromkeys(("one", "four", "kick:five", "disabled"), {})
         sources = {channel: {"enabled": channel != "disabled"} for channel in live.creator_streams}
         with (
-            patch.object(ct, "RECORD_MAX", 0),
             patch.object(ct, "creator_profile", return_value=None),
             patch.object(ct, "creator_channels", return_value=sources),
             patch.object(ct, "stored_watchlist", return_value={"exclude": ["twitch:excluded"]}),

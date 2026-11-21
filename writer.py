@@ -4,7 +4,7 @@ from contextlib import closing
 from datetime import date, datetime
 from statistics import median
 import requests
-import secret_store
+import ai_models
 import network_policy
 from cliptool import ROOT, db, log, HANDLE
 
@@ -34,27 +34,21 @@ def examples():
     return "\n".join(f'- hook "{r["hook"]}" | caption "{r["caption"]}" | {r["v"]} views' for r in rows)
 
 def ask(prompt, fmt=None, timeout=75, model=None, short=False):
-    base = network_policy.endpoint(os.getenv("AI_BASE_URL", ""))
-    key = secret_store.value("AI_API_KEY")
-    if base and key:
-        r = requests.post(f"{base}/chat/completions", timeout=timeout, allow_redirects=False,
-                          headers={"Authorization": f"Bearer {key}"},
-                          json={"model": os.getenv("AI_MODEL", ""), "messages": [{"role": "user", "content": prompt}], "temperature": 0.8,
-                                **({"response_format": {"type": "json_object"}} if fmt else {})})
-        if r.is_redirect:
-            raise ValueError("The AI writer redirected the request.")
-        r.raise_for_status(); return r.json()["choices"][0]["message"]["content"]
+    connection = ai_models.connection("text")
+    if connection:
+        if fmt:
+            return json.dumps(connection.json_reply(prompt, response_format=fmt, timeout=timeout), ensure_ascii=False)
+        return connection.complete(prompt, timeout=timeout)
     options = {"temperature": 0.25, "num_predict": 220} if short else {"temperature": 0.8}
     r = network_policy.ollama_request(network_policy.ollama_base(), "generate",
-                                     {"model": model or MODEL, "prompt": prompt, "stream": False,
+                                     {"model": model or os.getenv("OLLAMA_MODEL", MODEL), "prompt": prompt, "stream": False,
                                       "options": options, **({"think": False} if short else {}), **({"format": fmt} if fmt else {})},
                                      (5, timeout))
     return r.json()["response"]
 
 
 def configured():
-    return bool(network_policy.ollama_base() or
-                (network_policy.endpoint(os.getenv("AI_BASE_URL", "")) and secret_store.value("AI_API_KEY")))
+    return bool(network_policy.ollama_base() or ai_models.connection("text"))
 
 def write(item):
     if not configured(): return template(item)
@@ -81,7 +75,7 @@ def write(item):
         if "not affiliated" not in cap.lower(): cap += " Fan page, not affiliated with Rockstar Games."
         return {"hook": hook, "caption": cap, "hashtags": tags or TAGS[:4], "variant": v}
     except Exception as e:
-        log("writer fallback:", e); return template(item)
+        log("writer fallback:", type(e).__name__); return template(item)
 
 def nightly():
     """Write a short brief with the next experiment and the limits of the evidence."""
@@ -153,13 +147,13 @@ def nightly():
             + json.dumps(evidence, ensure_ascii=False)
         )
         try:
-            body = ask(prompt, timeout=240, model=LEARN_MODEL, short=True) if configured() else "Connect your AI writer in Setup to generate a testing brief."
+            body = ask(prompt, timeout=240, model=os.getenv("OLLAMA_LEARN_MODEL", LEARN_MODEL), short=True) if configured() else "Connect your AI writer in Setup to generate a testing brief."
         except (requests.RequestException, KeyError, ValueError, TypeError) as exc:
             log("nightly: AI brief unavailable", type(exc).__name__)
             return
         if not isinstance(body, str) or not body.strip():
             return
-        pending.write_text(header + baseline + "\nUmbrel's analysis\n\n" + body.strip()[:6000] + "\n", encoding="utf-8")
+        pending.write_text(header + baseline + "\nAI analysis\n\n" + body.strip()[:6000] + "\n", encoding="utf-8")
         pending.replace(LEARN)
         log("nightly: TikTok testing brief updated")
     finally:

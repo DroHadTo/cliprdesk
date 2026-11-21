@@ -245,7 +245,7 @@ def evaluate(row, path, stamp, *, allow_fallback=False):
         stamp = updated
         sheet = posts.contact_sheet(path, review_upload=True)
         transcript = posts.clip_transcript(path, "split" if re_rendered else row["pick"])
-        model = os.getenv("OLLAMA_QUALITY_MODEL", "").strip() or posts.vision_model()
+        model = posts.quality_model()
         result = posts.ask_ollama(model, f"{REVIEW_PROMPT}\nTranscript data: {json.dumps(transcript[:850], ensure_ascii=False)}",
                                  image=sheet, tokens=175, temperature=0,
                                  timeout=480, response_format=REVIEW_SCHEMA)
@@ -283,8 +283,8 @@ def evaluate(row, path, stamp, *, allow_fallback=False):
             save(row["id"], stamp, state, score, reason, caption=caption, angle=angle, scene=scene,
                  viral_score=viral_score, event=event, calibration=calibration, fallback=fallback)
     except requests.ConnectionError:
-        ct.log("TikTok quality review waiting for Umbrel connection")
-        save(row["id"], stamp, "waiting", None, "Umbrel is unreachable. Waiting to reconnect.", CONNECT_RETRY_SECONDS)
+        ct.log("TikTok quality review waiting for vision connection")
+        save(row["id"], stamp, "waiting", None, "The vision provider is unreachable. Waiting to reconnect.", CONNECT_RETRY_SECONDS)
         return CONNECT_RETRY_SECONDS
     except PermissionError:
         save(row["id"], stamp, "waiting", None,
@@ -292,7 +292,7 @@ def evaluate(row, path, stamp, *, allow_fallback=False):
     except (requests.RequestException, ValueError, KeyError, AttributeError, TypeError, OSError,
             RuntimeError, subprocess.SubprocessError, posts.PostError) as exc:
         ct.log("TikTok quality review", type(exc).__name__)
-        details = str(exc) if isinstance(exc, posts.PostError) else "The clip or Umbrel review was unavailable. Retrying."
+        details = str(exc) if isinstance(exc, posts.PostError) else "The clip or AI review was unavailable. Retrying."
         save(row["id"], stamp, "waiting", None, details, 300)
 
 
@@ -300,7 +300,7 @@ def process_next():
     settings = autopost.get_settings()
     if not settings or not settings["enabled"] or not autopost.configured() or not autopost.delivery_base():
         return False
-    if not posts.ollama_url() or not (os.getenv("OLLAMA_QUALITY_MODEL", "").strip() or posts.vision_model()):
+    if not posts.vision_configured(posts.quality_model()):
         return False
     allowed, params = ct.creator_filter(ct.creator_profile())
     with closing(ct.db()) as conn:

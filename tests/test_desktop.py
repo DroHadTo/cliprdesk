@@ -80,3 +80,34 @@ class DesktopTests(TestCase):
         self.assertEqual(self.client.get("/desk.js").status_code, 200)
         self.assertEqual(self.client.post("/autopost/pause", headers={"Origin": "https://example.com"}).status_code, 403)
         self.assertEqual(self.client.get("/healthz", headers={"Host": "example.com"}).status_code, 403)
+
+    def test_live_picker_excludes_selected_channels_and_enrollment_is_explicit(self):
+        origin = f"http://127.0.0.1:{ct.PORT}"
+        with closing(ct.db()) as conn, conn:
+            conn.execute("INSERT INTO creator_channels(channel,own) VALUES('shroud',1)")
+        listings = {slug: {"user_name": slug, "title": "Live stream", "game_name": "Gaming"} for slug in ("shroud", "lirik")}
+        with (
+            patch.object(ct, "watchlist", return_value={"include":[],"exclude":[]}),
+            patch.dict("os.environ", {"TWITCH_CLIENT_ID":""}),
+            patch.object(ct, "twitch_live_nokey", side_effect=listings.get),
+        ):
+            self.client.get("/creators")
+            result = self.client.post("/creators/discover", data={"platform":"twitch"}, headers={"Origin":origin})
+            self.assertIn("value='lirik'", result.text)
+            self.assertNotIn("type=checkbox name=channels value='shroud'", result.text)
+            self.assertNotIn("lirik", ct.creator_channels())
+            self.client.post("/creators/enroll", data={"platform":"twitch","channels":["lirik"],"permission":"permission","enabled":"true"},
+                             headers={"Origin":origin})
+            self.assertTrue(ct.creator_enabled("lirik"))
+            self.assertFalse(ct.creator_enabled("shroud"))
+
+    def test_ai_setup_does_not_leak_or_reuse_a_key_when_switching_providers(self):
+        origin = f"http://127.0.0.1:{ct.PORT}"
+        with patch.dict("os.environ", {"AI_PROVIDER":"openai","AI_API_KEY":"private-fixture-key","AI_MODEL":"fixture-text"}):
+            page = self.client.get("/setup")
+            self.assertIn("Anthropic (Claude)",page.text)
+            self.assertIn("Custom OpenAI-compatible API",page.text)
+            self.assertNotIn("private-fixture-key",page.text)
+            reply = self.client.post("/setup/save", data={"section":"ai","AI_PROVIDER":"gemini"}, headers={"Origin":origin})
+            self.assertEqual(reply.status_code,400)
+            self.assertIn("Enter the key for the new provider",reply.text)

@@ -42,7 +42,7 @@ def page(title, path, content):
         <meta name="theme-color" content="#10121a">
         <meta name="description" content="Clip Desk is an open-source Windows workspace for capturing, editing and publishing vertical livestream clips.">
         <meta name="author" content="DroMeta">
-        <title>{title} | Clip Desk</title><link rel="stylesheet" href="/clipdesk.css?v=3"></head>
+        <title>{title} | Clip Desk</title><link rel="stylesheet" href="/clipdesk.css?v=4"></head>
         <body class="public-site"><a class="skip-link" href="#content">Skip to content</a>
         <header class="public-head"><div class="windowbar">
         <a href="/" class="brand"><span class="brand-mark" aria-hidden="true"></span>Clip Desk</a>
@@ -98,8 +98,8 @@ def home():
         <div class="section-heading"><h2 id="workflow-title" class="section-title">Capture, review and publish</h2>
         <a href="{WORKFLOW}">Workflow guide</a></div>
         <div class="feature-grid">
-        <article class="card"><h3>Capture around the moment</h3><p>Enable your own channel or a creator you have permission to clip.
-        Buffer a livestream and capture the seconds around the moment you mark.</p></article>
+        <article class="card"><h3>Capture around the moment</h3><p>Discover live creators or enable your own Twitch and Kick channels.
+        Every monitored stream can buffer and generate clips when live.</p></article>
         <article class="card"><h3>Review the vertical cut</h3><p>Check the framing and on-screen captions, trim the timing and export an edit package for your editor.</p></article>
         <article class="card"><h3>Publish from your workspace</h3><p>Prepare a manual upload or use the dedicated GTA 6 workspace for scoring and optional TikTok automation.</p>
         <p><a href="/gta6">Explore the GTA 6 workspace</a></p></article>
@@ -149,7 +149,7 @@ def downloads():
       <h1 class="page-title">Download Clip Desk</h1>
       <section class="panel download-package"><h2>Complete Windows package</h2>
       <p>Free download. Includes the capture worker, facecam tools, captions, editor exports,
-      clip scoring, research, Buffer and R2 publishing, and Whop integration.</p>{release}</section>
+      clip scoring, bring-your-own AI providers, research, Buffer and R2 publishing, and Whop integration.</p>{release}</section>
       <section class="panel"><h2>Open-source software</h2>
       <p>Clip Desk’s original code is available under the <a href="{LICENSE}">MIT License</a>. You can use,
       modify and redistribute it with the included copyright and license notice. Third-party components and footage have their own terms.</p>

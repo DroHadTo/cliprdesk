@@ -15,7 +15,7 @@ WORKER = "GTA6cliptool"
 FILES = (
     ".env.example", ".gitignore", "CONTRIBUTING.md", "EARNINGS.md", "LICENSE", "MEDIA-TOOLS.md", "OPEN-SOURCE.md", "README.md", "README.txt",
     "SECURITY.md", "THIRD-PARTY-NOTICES.md",
-    "app.py", "autopost.py", "campaigns_seed.json", "cliptool.py", "creator_rights.py", "earnings_worker.py", "facecam.py", "growth.py", "media_tools.py",
+    "ai_models.py", "app.py", "autopost.py", "campaigns_seed.json", "cliptool.py", "creator_rights.py", "earnings_worker.py", "facecam.py", "growth.py", "media_tools.py",
     "models/LICENSE-ultraface.txt", "models/ultraface.onnx", "posts.py", "quality.py",
     "network_policy.py", "requirements.txt", "requirements-media.txt", "research.py", "secret_store.py", "setup.bat", "setup_helper.py",
     "start.bat", "start_hidden.bat", "verify_sha256.py", "virality.py", "web/static/clipdesk.css", "web/static/desk.js",

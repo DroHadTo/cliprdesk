@@ -8,6 +8,7 @@ from subprocess import TimeoutExpired
 from tempfile import TemporaryDirectory
 from urllib.parse import quote, urlencode, urlsplit
 import requests, uvicorn
+import ai_models
 import secret_store
 import network_policy
 import creator_rights
@@ -29,6 +30,7 @@ import whop_api
 async def lifespan(_):
     stop = threading.Event()
     start()
+    threading.Thread(target=posts.run, args=(stop,), daemon=True).start()
     threading.Thread(target=autopost.run, args=(stop,), daemon=True).start()
     threading.Thread(target=growth.run, args=(stop,), daemon=True).start()
     threading.Thread(target=quality.run, args=(stop,), daemon=True).start()
@@ -184,7 +186,7 @@ def page(title, body, req=None, *, workspace="gta6"):
     return HTMLResponse(
         f"<!doctype html><html lang=en><head><meta charset=utf-8>"
         f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-        f"<title>{E(title)} &middot; Clip Desk</title><link rel=stylesheet href=/clipdesk.css?v=3>"
+        f"<title>{E(title)} &middot; Clip Desk</title><link rel=stylesheet href=/clipdesk.css?v=4>"
         "<script defer src=/desk.js?v=2></script></head>"
         "<body><a class=skip-link href=#content>Skip to content</a><div class=app-shell>"
         "<aside class=sidebar><a class=brand href=/creators><span class=brand-mark aria-hidden=true></span>Clip Desk</a>"
@@ -352,7 +354,8 @@ def today(request: Request, creator: str = "", number: int = Query(1, alias="pag
     top = (f"<div class=hero><div class=panel><div class=big>{count}</div><small>clips today</small></div><div class=panel><div class=big>{n}/{ct.TARGET}</div><small>streamers (daily goal)</small></div>"
            f"<div class=panel><div class=big>{posted}/{posts.DAILY_LIMIT}</div><small>posted · {reserved} reserved</small><br><a href=/posts>TikTok queue</a></div><div><h2>Today, {ct.today()}</h2></div></div>")
     top += ("<form method=post action=/run style=display:inline><button>Run backfill now</button></form> "
-            "<form method=post action=/vod style=display:inline><input name=vod placeholder='Twitch VOD link' size=34><input name=n value=5 size=2><button>Clip VOD chat spikes</button></form>")
+            "<form method=post action=/vod style=display:inline><input name=vod aria-label='Twitch VOD URL' placeholder='Twitch VOD link' size=34>"
+            "<label>Clips (0 for all)<input name=n type=number min=0 value=5></label><button>Clip VOD chat spikes</button></form>")
     if not os.getenv("TWITCH_CLIENT_ID"): top += "<p><small>Keyless mode: watching your Twitch + Kick watchlist live. Add Twitch keys only for the full GTA live list and the daily top-clips backfill.</small></p>"
     listing = "<div class=grid>" + "".join(card(r, camps) for r in rows) + "</div>" if rows else "<p>No clips today for this selection.</p>"
     return page("Today", top + tabs + listing + clip_pager(ct.TODAY_PATH, number, has_next, creator), request)
@@ -480,9 +483,8 @@ def autopost_page(request: Request, connect: bool = False, notice: str = "", err
         recent.append(f"<li class=panel><a href='/review/{cid}#tiktok'>{E(job['hook'])} · {E(job['streamer'])}{label}</a>"
                       f"<p>{E(POST_STATUS.get(job['state'], 'Posted'))} {E(job['detail'])}</p>{resolve}</li>")
     activity = f"<ul class=post-queue>{''.join(recent)}</ul>" if recent else "<p>No automatic uploads yet.</p>"
-    model = os.getenv("OLLAMA_QUALITY_MODEL", "").strip() or posts.vision_model()
-    if enabled and (not posts.ollama_url() or not model):
-        feedback += "<p role=status>Save an Umbrel Ollama address and vision model in Setup to review clips.</p>"
+    if enabled and not posts.vision_configured(posts.quality_model()):
+        feedback += "<p role=status>Connect a vision model under <a href=/setup#ai>AI providers</a> to review clips.</p>"
     if enabled and eligibility["library"] and not eligibility["cleared"]:
         feedback += ("<p role=status>Auto posting is on. No unposted clips have a publishing grant. "
                      "<a href=/rights>Record permission</a> for footage you can publish.</p>")
@@ -506,7 +508,7 @@ def autopost_page(request: Request, connect: bool = False, notice: str = "", err
                 f"· up to {posts.DAILY_LIMIT} total per SAST day.</p>"
                 f"<p>30-day clipper usage · {api_used:,}/{autopost.BUFFER_REQUEST_LIMIT:,} Buffer requests · "
                 f"{storage_used / 1e9:.2f}/{autopost.R2_MONTH_BYTES / 1e9:.0f} GB staged in R2.</p>"
-                "<p>Umbrel writes a scene-specific caption and checks it against recent posts. Every automatic upload includes two relevant hashtags.</p>"
+                "<p>The selected AI writes a scene-specific caption and checks it against recent posts. Every automatic upload includes two relevant hashtags.</p>"
                 f"{controls}{getting_started if not enabled else ''}</section>"
                 f"<div class=post-actions><h2>Recent uploads</h2><a href=/autopost>Refresh</a>"
                 f"<a href=/posts>TikTok queue</a></div>{activity}", request)
@@ -561,7 +563,7 @@ def run():
     threading.Thread(target=ct.backfill, daemon=True).start(); return RedirectResponse(ct.TODAY_PATH, 303)
 
 @app.post("/vod")
-def vod(vod: str = Form(max_length=50), n: int = Form(5, ge=1, le=15), workspace: str = Form("gta6")):
+def vod(vod: str = Form(max_length=100), n: int = Form(5, ge=0), workspace: str = Form("gta6")):
     if workspace not in {"gta6", "creators"}:
         return HTMLResponse("Choose a valid workspace.", 400)
     if not re.fullmatch(r"(?:(?:https://)?(?:www\.)?twitch\.tv/videos/)?\d{1,20}", vod.strip()):
@@ -637,9 +639,8 @@ def stop_live_buffer(channel: str = Form(max_length=48), workspace: str = Form("
 @app.get("/live")
 def live_now(request: Request, notice: str = "", error: str = ""):
     profile = ct.creator_profile()
-    limit = (f"Up to {ct.RECORD_MAX} monitored streams can buffer at once." if ct.RECORD_MAX
-             else "Every monitored live channel starts a rolling buffer automatically.")
-    body = (f"<h2>Live now: GTA</h2><p>{limit} Chat highlights can be clipped automatically. <b>Clip moment</b> can mix lengths or use the "
+    body = ("<h2>Live now: GTA</h2><p>Every monitored live channel starts a rolling buffer automatically. "
+            "Chat highlights can be clipped automatically. <b>Clip moment</b> can mix lengths or use the "
             f"45-, 60-, or 75-second length you select. It saves about two thirds before your click and the rest after. "
             f"Allow up to {ct.lead_seconds(ct.MAX_CLIP_LENGTH)} seconds of buffered footage for the longest clip.</p>")
     if error: body += f"<p class=panel role=alert>{E(error)}</p>"
@@ -1217,9 +1218,9 @@ def learning(request: Request, notice: str = "", error: str = ""):
         public_examples.append(f"<h4>{E(source)}</h4><p>{E(status + scope)}</p>" + (f"<ul>{''.join(links)}</ul>" if links else ""))
     observations = "".join(f"<li>{E(item['source'])} · {E(item['opening'])} <strong>Payoff</strong> {E(item['payoff'])}</li>"
                            for item in research.visual_examples()[:4])
-    patterns = f"<ul>{observations}</ul>" if observations else "<p>Waiting for Umbrel to review an available video sample.</p>"
+    patterns = f"<ul>{observations}</ul>" if observations else "<p>Waiting for the vision model to review an available video sample.</p>"
     t = ct.ROOT.joinpath("learning.md")
-    brief = t.read_text(encoding="utf-8") if t.is_file() else "Umbrel writes a brief after collecting post metrics or research examples."
+    brief = t.read_text(encoding="utf-8") if t.is_file() else "The AI writes a brief after collecting post metrics or research examples."
     return page("Learning", f"<h2>Road to {growth.MILESTONES[-1]:,} views per post</h2>{feedback}{metrics}"
                 f"<p>Each milestone takes 60% of the latest {growth.MILESTONE_SAMPLE} measured posts, with at least "
                 f"{growth.MIN_SAMPLES} available. Each post uses its first Buffer snapshot at "
@@ -1233,7 +1234,7 @@ def learning(request: Request, notice: str = "", error: str = ""):
                 f"{scoring_trials}</section>"
                 f"<section class='panel growth-section'><h3>Format experiments</h3>{testing}{learning_results}</section>"
                 "<section class='panel growth-section'><h3>Trend research</h3>"
-                "<p>Public rankings and counts come from provider listings. Umbrel records openings and payoffs after inspecting available footage.</p>"
+                "<p>Public rankings and counts come from provider listings. The vision model records openings and payoffs after inspecting available footage.</p>"
                 f"<p>{E(discovery_status)} · <a href='/setup#research'>Discovery setup</a></p>{results}"
                 f"{''.join(public_examples)}<h4>Observed openings and payoffs</h4>{patterns}"
                 f"<p><a href='{growth.CREATIVE_CENTER}' target=_blank rel=noopener>TikTok trending videos</a> · "
@@ -1244,7 +1245,7 @@ def learning(request: Request, notice: str = "", error: str = ""):
                 "<label>Visible views (optional)<input type=number name=views min=0></label>"
                 "<label>What does the opening show?<textarea name=opening maxlength=300 required></textarea></label>"
                 "<button>Save example</button></form></section>"
-                f"<section class='panel growth-section'><h3>Umbrel's testing brief</h3><pre style='white-space:pre-wrap;overflow-wrap:anywhere'>{E(brief)}</pre></section>"
+                f"<section class='panel growth-section'><h3>AI testing brief</h3><pre style='white-space:pre-wrap;overflow-wrap:anywhere'>{E(brief)}</pre></section>"
                 "<section class='panel growth-section'><h3>Creator Rewards</h3><p>The view target uses regular video views. "
                 "Creator Rewards requires an eligible account, original videos over one minute, and qualified views. Check eligibility and actual earnings in TikTok Studio.</p>"
                 f"<p><a href='{growth.REWARDS}' target=_blank rel=noopener>TikTok Creator Rewards requirements</a></p></section>", request)
@@ -1277,6 +1278,38 @@ def creator_redirect(**message):
 
 @app.get("/creators")
 def creator_channels(request: Request, notice: str = "", error: str = ""):
+    return creator_page(request, notice, error)
+
+
+def creator_discovery(platform="", suggestions=None, source=""):
+    result = ""
+    if suggestions:
+        rows = "".join(
+            f"<label class=discovery-row><input type=checkbox name=channels value='{E(channel)}'>"
+            f"<span><strong>{E(label)}</strong><small>{E(' · '.join(value for value in (category, title) if value))}</small></span>"
+            "<span class='tag ok'>Live</span></label>"
+            for channel, (label, title, category) in suggestions.items()
+        )
+        result = (f"<form method=post action=/creators/enroll><input type=hidden name=platform value='{E(platform)}'>"
+                  f"<fieldset><legend>{E(source)}</legend><div class=discovery-options>{rows}</div></fieldset>"
+                  "<div class=post-actions><label>Permission <select name=permission required>"
+                  "<option value=''>Choose permission</option><option value=own>My own channels</option>"
+                  "<option value=permission>I have permission to clip these creators</option></select></label>"
+                  "<label><input type=checkbox name=enabled value=true> Enable clipping and recording now</label>"
+                  "<button>Add selected channels</button></div></form>")
+    elif suggestions is not None:
+        result = "<p role=status>No unselected live creators were found in this scan. You can add any channel by name.</p>"
+    return ("<section class=panel id=discover><h2>Discover live creators</h2>"
+            "<p>Check who is live and select channels you have permission to clip.</p>"
+            "<div class=post-actions>"
+            "<form method=post action=/creators/discover data-busy='Checking Twitch…'>"
+            "<input type=hidden name=platform value=twitch><button class=ghost>Check Twitch</button></form>"
+            "<form method=post action=/creators/discover data-busy='Checking Kick…'>"
+            "<input type=hidden name=platform value=kick><button class=ghost>Check Kick</button></form></div>"
+            f"{result}</section>")
+
+
+def creator_page(request, notice="", error="", *, platform="", suggestions=None, discovery_source=""):
     rows = []
     excluded = set(ct.watchlist().get("exclude", ()))
     for channel, source in ct.creator_channels().items():
@@ -1304,6 +1337,8 @@ def creator_channels(request: Request, notice: str = "", error: str = ""):
                 "<label>Permission <select name=permission required><option value=''>Choose permission</option>"
                 "<option value=own>My own channel</option><option value=permission>I have permission to clip this creator</option>"
                 "</select></label> <button>Add channel</button></form>"
+                + creator_discovery(platform, suggestions, discovery_source)
+                +
                 f"<p><a href=/creators/library>Open Creator clips</a></p>"
                 + ("<div class=grid>" + "".join(rows) + "</div>" if rows else "<p>Add a Twitch or Kick channel to get started.</p>"),
                 request, workspace="creators")
@@ -1311,15 +1346,41 @@ def creator_channels(request: Request, notice: str = "", error: str = ""):
 
 @app.post("/creators/add")
 def add_creator_channel(platform: str = Form(), source: str = Form(max_length=200), permission: str = Form()):
+    return enroll_creator_channels(platform, [source], permission, False, single=True)
+
+
+@app.post("/creators/discover")
+def discover_creators(request: Request, platform: str = Form()):
+    if platform not in ct.CREATOR_STARTERS:
+        return creator_redirect(error="Choose Twitch or Kick.")
+    rows, source = ct.discover_live_creators(platform)
+    return creator_page(request, platform=platform, suggestions=rows, discovery_source=source)
+
+
+@app.post("/creators/enroll")
+def select_creator_channels(platform: str = Form(), channels: list[str] = Form(default=[]),
+                            permission: str = Form(), enabled: bool = Form(False)):
+    return enroll_creator_channels(platform, channels, permission, enabled)
+
+
+def enroll_creator_channels(platform, sources, permission, enabled, *, single=False):
     if permission not in {"own", "permission"}:
         return creator_redirect(error="Choose whether you own the channel or have permission to clip it.")
     try:
-        channel = ct.parse_creator_channel(platform, source)
+        channels = dict.fromkeys(ct.parse_creator_channel(platform, source.removeprefix("kick:") if platform == "kick" else source)
+                                 for source in sources)
     except ValueError as exc:
         return creator_redirect(error=str(exc))
+    if not channels:
+        return creator_redirect(error="Select at least one live channel.")
     with posts.transaction() as conn:
-        cur = conn.execute("INSERT OR IGNORE INTO creator_channels(channel,own) VALUES(?,?)", (channel, int(permission == "own")))
-    return creator_redirect(notice="Channel added. Enable clipping when you are ready." if cur.rowcount else "This channel is already listed.")
+        cur = conn.executemany("INSERT OR IGNORE INTO creator_channels(channel,own,enabled) VALUES(?,?,?)",
+                               ((channel, int(permission == "own"), int(enabled)) for channel in channels))
+    if single:
+        return creator_redirect(notice="Channel added. Enable clipping when you are ready." if cur.rowcount else "This channel is already listed.")
+    if not cur.rowcount:
+        return creator_redirect(notice="Those channels are already listed.")
+    return creator_redirect(notice=f"Added {cur.rowcount} channel(s)." + (" Clipping is enabled." if enabled else " Enable clipping when you are ready."))
 
 
 @app.post("/creators/enable")
@@ -1340,8 +1401,8 @@ def creator_library(request: Request, number: int = Query(1, alias="page", ge=1,
     clips = "<div class=grid>" + "".join(card(row) for row in rows) + "</div>" if rows else "<p>No creator clips yet.</p>"
     return page("Creator clips", "<p>Review, export or prepare clips for manual posting.</p>"
                 "<form class=panel method=post action=/vod><input name=workspace type=hidden value=creators>"
-                "<label>Twitch VOD URL <input name=vod maxlength=50 required></label> "
-                "<label>Clips <input name=n type=number min=1 max=15 value=5></label> "
+                "<label>Twitch VOD URL <input name=vod maxlength=100 required></label> "
+                "<label>Clips (0 for all highlights) <input name=n type=number min=0 value=5></label> "
                 "<button>Import highlights</button></form>" + clips + clip_pager("/creators/library", number, has_next),
                 request, workspace="creators")
 
@@ -1675,30 +1736,52 @@ SETUP_KEYS = [("ntfy", "Phone alerts (ntfy)", [("NTFY_TOPIC", True), ("NTFY_SERV
               ("research", "Public trend research", [("TIKTOK_DISCOVERY_TOKEN", True), ("TIKTOK_ADVERTISER_ID", False),
                                                        ("TIKTOK_DISCOVERY_COUNTRY", False), ("IG_RESEARCH_TOKEN", True),
                                                        ("IG_RESEARCH_USER_ID", False), ("YT_RESEARCH_KEY", True)]),
-              ("ai", "Umbrel Ollama and AI writer", [("OLLAMA_URL", False), ("OLLAMA_API_TOKEN", True), ("OLLAMA_VISION_MODEL", False), ("OLLAMA_EMBED_MODEL", False),
-                                                        ("OLLAMA_QUALITY_MODEL", False),
-                                                        ("AI_BASE_URL", False), ("AI_API_KEY", True), ("AI_MODEL", False)])]
+              ("ai", "AI providers", [("OLLAMA_URL", False), ("OLLAMA_API_TOKEN", True), ("OLLAMA_MODEL", False),
+                                       ("OLLAMA_LEARN_MODEL", False), ("OLLAMA_VISION_MODEL", False), ("OLLAMA_EMBED_MODEL", False),
+                                       ("OLLAMA_QUALITY_MODEL", False), ("AI_PROVIDER", False), ("AI_BASE_URL", False),
+                                       ("AI_API_KEY", True), ("AI_MODEL", False), ("AI_VISION_MODE", False),
+                                       ("AI_VISION_MODEL", False)])]
 def checks():
     g = lambda k: bool(secret_store.value(k).strip())
     return {"ntfy": g("NTFY_TOPIC"), "twitch": g("TWITCH_CLIENT_ID") and g("TWITCH_CLIENT_SECRET"), "kick": g("KICK_CLIENT_ID") and g("KICK_CLIENT_SECRET"),
             "whop": g("WHOP_API_KEY"), "tiktok": g("TIKTOK_HANDLE"), "autopost": autopost.configured(),
             "research": growth.discovery_configured(), "ai": bool(network_policy.ollama_base() or
-            (network_policy.endpoint(secret_store.value("AI_BASE_URL")) and g("AI_API_KEY"))),
+            ai_models.connection("text") or ai_models.connection("vision")),
             "facecam": bool(ct.watchlist().get("facecam")), "gpu": ct.ENCODER in ("nvenc", "qsv") or "nvenc" in ct.ENCODER or "qsv" in ct.ENCODER}
 def qr_svg(text):
     try:
         import segno, io as _io; b = _io.BytesIO(); segno.make(text, error="m").save(b, kind="svg", scale=5, dark="#fff", light=None); return b.getvalue().decode()
     except Exception: return "<small>(pip install segno for a QR code)</small>"
 @app.get("/setup")
-def setup_page(request: Request, saved: str = ""):
+def setup_page(request: Request, saved: str = "", ai_notice: str = "", ai_error: str = ""):
     ok = checks(); cards = ""
     for key, title, fields in SETUP_KEYS:
-        inputs = ""
+        inputs = "<div class=ai-fields><fieldset><legend>Ollama and Umbrel</legend>" if key == "ai" else ""
         for name, secret in fields:
             val = secret_store.value(name)
+            if name == "AI_PROVIDER":
+                inputs += "</fieldset><fieldset><legend>Hosted and compatible APIs</legend>"
+                options = "".join(f"<option value='{key}'{' selected' if key == ai_models.provider() else ''}>{E(label)}</option>"
+                                  for key, (label, _) in ai_models.PRESETS.items())
+                inputs += f"<label>Hosted or compatible provider <select name=AI_PROVIDER>{options}</select></label>"
+                continue
+            if name == "AI_VISION_MODE":
+                selected = " selected" if val == "remote" else ""
+                inputs += ("<label>Video-frame review <select name=AI_VISION_MODE>"
+                           "<option value=local>Use Ollama</option>"
+                           f"<option value=remote{selected}>Send frames to the selected API</option></select></label>")
+                continue
             shown = ("set ••••" if val else "missing") if secret else (val or "missing")
+            label = name
             value = ""
             placeholder = "Paste new value (blank = keep)"
+            if key == "ai":
+                label = {"OLLAMA_URL": "Ollama URL", "OLLAMA_API_TOKEN": "Ollama token (optional)",
+                         "OLLAMA_MODEL": "Ollama text model", "OLLAMA_LEARN_MODEL": "Ollama learning model",
+                         "OLLAMA_VISION_MODEL": "Ollama vision model", "OLLAMA_QUALITY_MODEL": "Ollama quality model (optional)",
+                         "OLLAMA_EMBED_MODEL": "Ollama embeddings model (optional)", "AI_BASE_URL": "Custom base URL only",
+                         "AI_API_KEY": "Provider API key", "AI_MODEL": "Provider text model ID",
+                         "AI_VISION_MODEL": "Provider vision model ID"}[name]
             if key == "autopost":
                 shown = "Saved" if val else "Missing"
                 if secret:
@@ -1711,8 +1794,10 @@ def setup_page(request: Request, saved: str = ""):
             if name == "OLLAMA_EMBED_MODEL" and not val: shown = "optional"
             if name == "OLLAMA_QUALITY_MODEL" and not val: shown = posts.vision_model() or "missing"
             if name == "TIKTOK_DISCOVERY_COUNTRY" and not val: shown = "US (default)"
-            inputs += (f"<label><small>{name}: <b>{E(shown)}</b></small><input name={name} "
+            inputs += (f"<label><small>{label}: <b>{E(shown)}</b></small><input name={name} "
                        f"type={'password' if secret else 'text'} autocomplete=off placeholder='{placeholder}'{value} style=width:100%></label>")
+        if key == "ai":
+            inputs += "</fieldset></div>"
         extra = ""
         help_text = ""
         if key == "ntfy" and secret_store.value("NTFY_TOPIC"):
@@ -1737,7 +1822,16 @@ def setup_page(request: Request, saved: str = ""):
             extra = ("<p>Buffer reads each staged video at the public R2 URL. Use a dedicated bucket for this clipper.</p>"
                      "<p><a href=/autopost>Check automatic posting</a></p>")
         if key == "ai":
-            extra = "<p>Use your Umbrel address on a trusted private network. Use a trusted HTTPS endpoint to send an Ollama token.</p>"
+            help_text = ("<p>Use Ollama on Umbrel or connect a hosted API using your own key and model IDs. "
+                         "Selecting hosted video-frame review sends clip frames and transcripts to that provider. Provider charges and quotas apply.</p>")
+            if ai_notice or ai_error:
+                help_text += f"<p role={'alert' if ai_error else 'status'}>{E(ai_error or ai_notice)}</p>"
+            for role in ("text", "vision"):
+                if ai_models.connection(role):
+                    extra += (f"<form class=post-actions method=post action=/setup/ai/test><input type=hidden name=role value={role}>"
+                              f"<button class=ghost>Test {role} model access</button></form>")
+            extra += ("<p>Use the custom base URL for LM Studio, vLLM or another OpenAI-compatible server. "
+                      "Key-free HTTP is supported on loopback and private networks. API keys require HTTPS.</p>")
         if key == "research":
             extra = ("<p>TikTok needs an advertiser ID, approved Discovery token and a two-letter audience country. "
                      "Instagram Reels needs an approved Meta token and professional Instagram user ID. YouTube needs a Data API key.</p>"
@@ -1749,7 +1843,8 @@ def setup_page(request: Request, saved: str = ""):
                   "<label><input type=checkbox name=confirm value=1 required> Remove this provider's saved keys</label> "
                   "<button class=ghost>Remove keys</button></form>" if any(
                       secret and secret_store.value(name) for name, secret in fields) else "")
-        cards += (f"<div class=card id={key}><span class='tag {'ok' if st else 'bad'}'>{status}</span><h3>{title}</h3>{help_text}"
+        layout = "card ai-card" if key == "ai" else "card"
+        cards += (f"<div class='{layout}' id={key}><span class='tag {'ok' if st else 'bad'}'>{status}</span><h3>{title}</h3>{help_text}"
                   f"<form method=post action=/setup/save><input type=hidden name=section value={key}>{inputs}<button>Save on this PC</button></form>{extra}{remove}</div>")
     msg = "<p class=panel role=status>Settings saved.</p>" if saved else ""
     if ct.SECRET_LOAD_FAILURES:
@@ -1780,7 +1875,7 @@ async def setup_save(request: Request):
     for k, v in updates.items():
         if any(ch in v for ch in ("\r", "\n", "\0")) or len(v) > (4096 if k in secret_store.KEYS else 300):
             return HTMLResponse("A setting was too long or contained a line break.", status_code=400)
-    for name in {"AI_BASE_URL", "NTFY_SERVER"} & updates.keys():
+    for name in {"NTFY_SERVER"} & updates.keys():
         if not network_policy.endpoint(updates[name]):
             return HTMLResponse("Enter a valid HTTPS service address.", status_code=400)
     if section == "ai" and {"OLLAMA_URL", "OLLAMA_API_TOKEN"} & updates.keys():
@@ -1788,6 +1883,21 @@ async def setup_save(request: Request):
         token = updates.get("OLLAMA_API_TOKEN", secret_store.value("OLLAMA_API_TOKEN"))
         if not network_policy.endpoint(url, local_http=not token):
             return HTMLResponse("Enter a private Ollama address or use HTTPS for a token.", status_code=400)
+    if section == "ai":
+        new_provider = updates.get("AI_PROVIDER", ai_models.provider())
+        vision_mode = updates.get("AI_VISION_MODE", secret_store.value("AI_VISION_MODE") or "local")
+        if new_provider not in ai_models.PRESETS or vision_mode not in {"local", "remote"}:
+            return HTMLResponse("Choose a supported AI connection and vision mode.", status_code=400)
+        saved_key = secret_store.value("AI_API_KEY")
+        key = updates.get("AI_API_KEY", saved_key)
+        base = updates.get("AI_BASE_URL", secret_store.value("AI_BASE_URL"))
+        if new_provider == "custom" and base and not network_policy.endpoint(base, local_http=not key):
+            return HTMLResponse("Enter a valid custom endpoint. API keys require HTTPS.", status_code=400)
+        if new_provider not in {ai_models.provider(), "disabled"} and saved_key and "AI_API_KEY" not in updates:
+            return HTMLResponse("Enter the key for the new provider, or remove the saved key before switching to a key-free server.", status_code=400)
+        if vision_mode == "remote" and not (ai_models.base_url(new_provider, base, key)
+                                           and updates.get("AI_VISION_MODEL", secret_store.value("AI_VISION_MODEL"))):
+            return HTMLResponse("Save the provider connection and a vision model ID to enable hosted frame review.", status_code=400)
     if "NTFY_TOPIC" in updates and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", updates["NTFY_TOPIC"]):
         return HTMLResponse("Enter an ntfy topic with up to 64 letters, digits, underscores or dashes.", status_code=400)
     for address, credential in (("AI_BASE_URL", "AI_API_KEY"), ("OLLAMA_URL", "OLLAMA_API_TOKEN"),
@@ -1806,7 +1916,23 @@ async def setup_save(request: Request):
         if autopost.configured() and autopost.delivery_base():
             return autopost_redirect(connect=1, notice="The credentials and delivery URL are saved on this PC.")
         return autopost_redirect(error="Fill in the credentials and the public delivery URL in Setup to connect TikTok.")
-    return RedirectResponse("/setup?saved=1", 303)
+    return RedirectResponse("/setup?saved=1" + ("#ai" if section == "ai" else ""), 303)
+
+
+@app.post("/setup/ai/test")
+def test_ai_provider(role: str = Form()):
+    if role not in {"text", "vision"}:
+        return HTMLResponse("Choose a text or vision model.", status_code=400)
+    connection = ai_models.connection(role)
+    if not connection:
+        message = {"ai_error": "Save a provider and model before testing."}
+    else:
+        try:
+            connection.complete("Reply with OK.", tokens=16, timeout=30)
+            message = {"ai_notice": f"The provider returned a reply from the {role} model."}
+        except (requests.RequestException, KeyError, ValueError, TypeError, AttributeError, IndexError):
+            message = {"ai_error": "The provider did not return a reply. Check your key, endpoint, quota and model ID."}
+    return RedirectResponse("/setup?" + urlencode(message) + "#ai", 303)
 
 
 @app.post("/setup/forget")

@@ -7,6 +7,7 @@ from unittest.mock import patch
 import posts
 import quality
 import research
+import ai_models
 
 
 class QualityTests(unittest.TestCase):
@@ -40,6 +41,28 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(body["messages"], [{"role": "user", "content": "Review", "images": ["frames"]}])
         self.assertEqual(body["format"], quality.REVIEW_SCHEMA)
         self.assertFalse(body["think"])
+
+    def test_hosted_text_and_vision_routes_are_separately_opted_in(self):
+        values = {"AI_PROVIDER":"anthropic","AI_API_KEY":"test-key","AI_MODEL":"text-model","AI_VISION_MODEL":"vision-model"}
+        with patch("ai_models.secret_store.value", side_effect=lambda key: values.get(key,"")):
+            self.assertEqual(ai_models.connection("text").model,"text-model")
+            self.assertIsNone(ai_models.connection("vision"))
+            values["AI_VISION_MODE"] = "remote"
+            with patch("ai_models.requests.Session") as session:
+                call = session.return_value.__enter__.return_value.post
+                call.return_value.status_code = 200
+                call.return_value.json.return_value = {"content":[{"type":"text","text":'{"ready":true}'}]}
+                data = posts.ask_ollama("ignored-local-model","Review the clip",image="test-jpeg",response_format={"type":"object"})
+            self.assertEqual(data,{"ready":True})
+            self.assertEqual(call.call_args.args[0],"https://api.anthropic.com/v1/messages")
+            self.assertEqual(call.call_args.kwargs["json"]["model"],"vision-model")
+            self.assertEqual(call.call_args.kwargs["json"]["messages"][0]["content"][1]["source"]["data"],"test-jpeg")
+            self.assertFalse(call.call_args.kwargs["allow_redirects"])
+
+    def test_custom_local_http_accepts_local_models_without_sending_keys_in_cleartext(self):
+        self.assertEqual(ai_models.base_url("custom","http://127.0.0.1:1234/v1",""),"http://127.0.0.1:1234/v1")
+        self.assertEqual(ai_models.base_url("custom","http://127.0.0.1:1234/v1","test-key"),"")
+        self.assertEqual(ai_models.base_url("openai","https://other.example/v1","test-key"),"https://api.openai.com/v1")
 
     def test_publish_caption_has_specific_evidence_and_no_fake_game_title(self):
         scene = "A motorcycle gets stuck in a garage doorway."

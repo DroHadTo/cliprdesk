@@ -1,6 +1,8 @@
 """GTA6cliptool core: Twitch discovery (live spikes + daily top clips), download, 9:16 render, notify, sqlite store."""
 import asyncio, json, os, random, re, shutil, sqlite3, statistics, subprocess, sys, threading, time
+from bisect import bisect_left
 from collections import Counter, deque, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from itertools import cycle
@@ -31,7 +33,6 @@ CLIP_LENGTHS = (45, 60, 75)
 DEFAULT_CLIP_LENGTH = CLIP_LENGTHS[0]
 MAX_CLIP_LENGTH = max(CLIP_LENGTHS)
 AUTO_CLIP_LEAD = 8
-MAX_PER = int(os.getenv("MAX_PER_STREAMER_PER_DAY", "40"))
 LANGS = [l for l in os.getenv("LANGUAGES", "en").split(",") if l]
 PORT = int(os.getenv("PORT", "8788"))
 WATCHLIST_ONLY = os.getenv("WATCHLIST_ONLY", "").lower() in {"1", "true", "yes"}
@@ -40,7 +41,6 @@ FONT = os.getenv("FONT", "C\\:/Windows/Fonts/arialbd.ttf")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")   # auto = try CUDA, fall back to CPU int8
 RENDER_WORKERS = threading.BoundedSemaphore(int(os.getenv("RENDER_WORKERS", "2")))
-RECORD_MAX = max(0, int(os.getenv("RECORD_MAX", "0")))
 KEYWORDS = {"lul": 1, "kekw": 1, "omegalul": 2, "lmao": 1, "pog": 1, "pogchamp": 1, "poggers": 1,
             "clip": 3, "clipit": 5, "clip it": 5, "holy": 1, "wtf": 1, "monkas": 1, "w": 1, "kekl": 1}
 # always-on chat watch words (merged with the user's own list on the Watchlist page)
@@ -306,6 +306,12 @@ def game_ids():
 def iso(dt): return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # ---------------- Live now lists (Twitch + Kick official APIs) ----------------
+def watched_twitch_streams(logins):
+    # Helix accepts 100 user_login filters per request.
+    return [row for start in range(0, len(logins), 100)
+            for row in helix("streams", user_login=logins[start:start + 100], type="live")["data"]]
+
+
 def twitch_live(n=50):
     games = list(game_ids())
     profile = creator_profile()
@@ -313,7 +319,7 @@ def twitch_live(n=50):
         rows = helix("streams", game_id=games, first=n, type="live")["data"]
     else:
         logins = watchlist()["include"]
-        rows = helix("streams", user_login=logins[:100], type="live")["data"] if logins else []
+        rows = watched_twitch_streams(logins)
         rows = [stream for stream in rows if stream["game_id"] in games and creator_channel_allowed(stream["user_login"], profile)]
     return sorted(rows, key=lambda s: -s["viewer_count"])
 
@@ -719,10 +725,13 @@ def vod(vod_id, max_clips=5, workspace="gta6"):
         hist.append(n)
     picked = []
     for ratio, off in sorted(spikes, reverse=True):
-        if all(abs(off - p) >= MAX_CLIP_LENGTH for p in picked): picked.append(off)
-        if len(picked) >= max_clips: break
+        index = bisect_left(picked, off)
+        if ((not index or off - picked[index - 1] >= MAX_CLIP_LENGTH)
+                and (index == len(picked) or picked[index] - off >= MAX_CLIP_LENGTH)):
+            picked.insert(index, off)
+        if max_clips and len(picked) >= max_clips: break
     made = []
-    for off, length in zip(sorted(picked), cycle(CLIP_LENGTHS)):
+    for off, length in zip(picked, cycle(CLIP_LENGTHS)):
         b, e = vod_window(off, length, total)
         try:
             clip_id = vod_clip_id(vod_id, off)
@@ -884,6 +893,65 @@ def kick_channel(slug):
     r = requests.get(f"https://kick.com/api/v2/channels/{slug}", timeout=15, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     r.raise_for_status(); return r.json()
 
+
+# Checked on demand only. None of these channels is enrolled by default.
+CREATOR_STARTERS = {
+    "twitch": ("shroud", "lirik", "tarik", "pokimane", "cohhcarnage", "summit1g", "emiru", "fuslie"),
+    "kick": ("xqc", "trainwreckstv", "westcol", "adinross", "amouranth", "fousey", "rakin", "n3on"),
+}
+
+
+def discover_live_creators(platform):
+    if platform not in CREATOR_STARTERS:
+        raise ValueError("Choose Twitch or Kick.")
+    watched = watchlist()
+    selected = set(creator_channels()) | set(watched["include"]) | {f"kick:{slug}" for slug in watched.get("kick_include", ())}
+    excluded = {name.lower() for name in watched["exclude"]}
+    suggestions = {}
+
+    def add(slug, label, title, category):
+        try:
+            channel = parse_creator_channel(platform, slug)
+        except (ValueError, AttributeError):
+            return
+        if channel not in selected and not channel_excluded(channel, excluded):
+            suggestions[channel] = (str(label or slug)[:100], str(title or "")[:250], str(category or "")[:100])
+
+    if platform == "twitch" and os.getenv("TWITCH_CLIENT_ID") and secret_store.value("TWITCH_CLIENT_SECRET"):
+        try:
+            for stream in helix("streams", first=50, type="live")["data"]:
+                add(stream["user_login"], stream.get("user_name"), stream.get("title"), stream.get("game_name"))
+            return suggestions, "Live Twitch directory"
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            pass  # The opt-in starter list can still be checked without API credentials.
+
+    def check(slug):
+        try:
+            if platform == "twitch":
+                stream = twitch_live_nokey(slug)
+                if stream:
+                    return slug, stream["user_name"], stream["title"], stream["game_name"]
+            else:
+                channel = kick_channel(slug)
+                stream = channel.get("livestream")
+                if stream:
+                    category = (stream.get("categories") or [{}])[0]
+                    return slug, channel.get("user", {}).get("username"), stream.get("session_title"), category.get("name")
+        except (OSError, ValueError, requests.RequestException, subprocess.SubprocessError, KeyError, TypeError):
+            pass
+        return None
+
+    starters = [slug for slug in CREATOR_STARTERS[platform]
+                if parse_creator_channel(platform, slug) not in selected
+                and not channel_excluded(parse_creator_channel(platform, slug), excluded)]
+    if starters:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for result in pool.map(check, starters):
+                if result:
+                    add(*result)
+    return suggestions, f"{platform.title()} live starter list"
+
+
 class Live:
     def __init__(self):
         self.counts = defaultdict(float); self.kw = defaultdict(lambda: defaultdict(int))
@@ -1008,8 +1076,6 @@ class Live:
             # Prefer the GTA workspace when a live channel appears in both lists.
             for ch, workspace in sorted(live.items(), key=lambda item: item[1] != "gta6"):
                 if ch not in self.rec:
-                    if RECORD_MAX and len(self.rec) >= RECORD_MAX:
-                        continue
                     try:
                         self.rec[ch] = Recorder(ch, f"https://kick.com/{ch[5:]}" if ch.startswith("kick:") else None)
                     except (OSError, ValueError) as exc:
@@ -1065,8 +1131,6 @@ class Live:
                 return f"Capturing a {requested}-second clip. The finished video will appear in {destination}."
             if active:
                 self.rec.pop(ch).stop()
-            if RECORD_MAX and len(self.rec) >= RECORD_MAX:
-                raise ValueError(f"All {RECORD_MAX} recording slots are in use. Try a stream already recording.")
             self.rec[ch] = Recorder(ch, url)
             self.armed.add(ch)
             if workspace == "creators":
@@ -1147,7 +1211,7 @@ class Live:
               try:
                 gids = list(game_ids())
                 data = helix("streams", game_id=gids, first=wl.get("live_top_streams", 20), type="live")["data"] if profile is None and not WATCHLIST_ONLY else []
-                if wl["include"]: data += helix("streams", user_login=wl["include"][:100], type="live")["data"]
+                data += watched_twitch_streams(wl["include"])
                 self.streams = {s["user_login"]: s for s in data if s["game_id"] in gids and s["user_login"] not in excl
                                 and (not LANGS or s["language"] in LANGS or s["user_login"] in wl["include"])}
                 await self.sync_joins()
@@ -1218,10 +1282,6 @@ class Live:
         s = self.stream_info(ch, workspace)
         if not s: return
         name = s["name"] if kick else s["user_name"]
-        with closing(db()) as conn:
-            if used_today(conn, workspace).get(name.lower(), 0) >= MAX_PER:
-                log("live: daily cap for", ch)
-                return
         spike = {"score": round(n), "baseline": round(mu, 1), "keywords": kws, "at": datetime.fromtimestamp(t).isoformat(timespec="seconds")}
         base = dict(source="live-spike", streamer=name, platform="Kick" if kick else "Twitch", spike=spike,
                     workspace=workspace, channel=ch,

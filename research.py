@@ -202,8 +202,8 @@ def refresh(*, force=False):
 
 
 def inspect_example(media):
-    model = os.getenv("OLLAMA_QUALITY_MODEL", "").strip() or posts.vision_model()
-    if not posts.ollama_url() or not model:
+    model = posts.quality_model()
+    if not posts.vision_configured(model):
         return
     with posts.transaction() as conn:
         last = conn.execute("SELECT checked FROM growth_source_research WHERE source='Umbrel visual review'").fetchone()
@@ -286,8 +286,8 @@ def observe_frames(model, url, source, creator, frames, transcript):
             if valid_observation(first, last):
                 pattern, opening, payoff = result["pattern"], first, last
     except (requests.RequestException, KeyError, ValueError, AttributeError, TypeError) as exc:
-        ct.log("Umbrel research review", type(exc).__name__)
-        visual_status("Umbrel could not review today's sample. The next scan will retry.")
+        ct.log("AI research review", type(exc).__name__)
+        visual_status("The vision provider could not review today's sample. The next scan will retry.")
         return
     with posts.transaction() as conn:
         conn.execute("INSERT OR IGNORE INTO growth_visual_research VALUES(?,?,?,?,?,?,?)",

@@ -164,6 +164,8 @@ def page(title, body, req=None, *, workspace="gta6"):
         channels = tuple(ct.LIVE.creator_streams)
         kick = sum(channel.startswith("kick:") for channel in channels)
         st = {"channels": len(channels) - kick, "kick": kick, "recording": len(ct.LIVE.creator_buffers)}
+    else:
+        st = dict(st, channels=len(ct.LIVE.streams), recording=max(0, st["recording"] - len(ct.LIVE.creator_buffers)))
     cur = req.url.path if req else ""
     groups = (
         ("Creators", (("/creators", "Creator channels"), ("/creators/library", "Creator clips"))),
@@ -593,7 +595,7 @@ def moment_button(channel, workspace="gta6"):
     button = (f"<form class=moment method=post action=/live/clip><input type=hidden name=channel value='{E(channel)}'>"
               f"<input type=hidden name=workspace value='{E(workspace)}'>"
               f"{select}<button {'disabled' if state == 'pending' else ''}>{label}</button></form>")
-    if armed and channel in ct.LIVE.armed and state != "pending":
+    if armed and channel in ct.LIVE.armed and channel not in ct.LIVE.live_workspaces() and state != "pending":
         button += (f"<form class=moment method=post action=/live/stop-buffer><input type=hidden name=channel value='{E(channel)}'>"
                    f"<input type=hidden name=workspace value='{E(workspace)}'>"
                    "<button class=ghost>Stop buffer</button></form>")
@@ -635,7 +637,9 @@ def stop_live_buffer(channel: str = Form(max_length=48), workspace: str = Form("
 @app.get("/live")
 def live_now(request: Request, notice: str = "", error: str = ""):
     profile = ct.creator_profile()
-    body = (f"<h2>Live now: GTA</h2><p>Start the buffer before watching. <b>Clip moment</b> can mix lengths or use the "
+    limit = (f"Up to {ct.RECORD_MAX} monitored streams can buffer at once." if ct.RECORD_MAX
+             else "Every monitored live channel starts a rolling buffer automatically.")
+    body = (f"<h2>Live now: GTA</h2><p>{limit} Chat highlights can be clipped automatically. <b>Clip moment</b> can mix lengths or use the "
             f"45-, 60-, or 75-second length you select. It saves about two thirds before your click and the rest after. "
             f"Allow up to {ct.lead_seconds(ct.MAX_CLIP_LENGTH)} seconds of buffered footage for the longest clip.</p>")
     if error: body += f"<p class=panel role=alert>{E(error)}</p>"
@@ -649,8 +653,11 @@ def live_now(request: Request, notice: str = "", error: str = ""):
     else:
      try:
         rows = "".join(f"<tr id='{E(s['user_login'])}'><td><a href='https://twitch.tv/{E(s['user_login'])}' target=_blank>{E(s['user_name'])}</a>{' <b class=ok>watching chat</b>' if s['user_login'] in ct.LIVE.joined else ''}{moment_button(s['user_login'])}</td>"
-                       f"<td>{E(s['viewer_count'])}</td><td>{E(s['game_name'])}</td><td>{E(s['language'])}</td><td><small>{E(s['title'])}</small></td></tr>" for s in ct.twitch_live())
-        body += f"<h3>Twitch</h3><table><tr><th>Streamer</th><th>Viewers</th><th>Game</th><th>Lang</th><th>Title</th></tr>{rows}</table>"
+                       f"<td>{E(s['viewer_count'])}</td><td>{E(s['game_name'])}</td><td>{E(s['language'])}</td><td><small>{E(s['title'])}</small></td></tr>"
+                       for s in sorted(ct.LIVE.streams.values(), key=lambda row: -row["viewer_count"])
+                       if ct.creator_channel_allowed(s["user_login"], profile))
+        body += (f"<h3>Twitch</h3><table><tr><th>Streamer</th><th>Viewers</th><th>Game</th><th>Lang</th><th>Title</th></tr>"
+                 f"{rows or '<tr><td colspan=5>No monitored Twitch streams are live in GTA yet.</td></tr>'}</table>")
      except Exception as e: body += f"<p class=bad>Twitch: {E(e)}</p>"
     try:
         kw = "".join(f"<tr id='kick-{E(k)}'><td><a href='https://kick.com/{E(k)}' target=_blank>{E(v['name'])}</a> <b class=ok>watching chat{' + recording' if 'kick:' + k in ct.LIVE.rec else ''}</b>{moment_button('kick:' + k)}</td>"
@@ -662,7 +669,8 @@ def live_now(request: Request, notice: str = "", error: str = ""):
         if k is not None:
             rows = "".join(f"<tr id='kick-{E(s['channel']['slug'])}'><td><a href='https://kick.com/{E(s['channel']['slug'])}' target=_blank>{E(s['broadcaster_user']['username'])}</a>{moment_button('kick:' + s['channel']['slug'])}</td><td>{E(s['viewer_count'])}</td>"
                            f"<td>{E(s['category']['name'])}</td><td>{E(s['language_code'])}</td><td><small>{E(s['title'])}</small></td></tr>" for s in k if s['channel']['slug'] not in ct.LIVE.kick)
-            body += f"<h3>Kick GTA category</h3><table><tr><th>Streamer</th><th>Viewers</th><th>Game</th><th>Lang</th><th>Title</th></tr>{rows}</table>"
+            body += (f"<h3>Kick GTA category</h3><p>Follow a channel in <a href=/watchlist>Watchlist</a> to buffer it automatically.</p>"
+                     f"<table><tr><th>Streamer</th><th>Viewers</th><th>Game</th><th>Lang</th><th>Title</th></tr>{rows}</table>")
     except Exception as e: body += f"<p class=bad>Kick: {E(e)}</p>"
     return page("Live now", body, request)
 
@@ -1275,7 +1283,7 @@ def creator_channels(request: Request, notice: str = "", error: str = ""):
         kick = channel.startswith("kick:")
         slug = channel.removeprefix("kick:")
         platform, host = ("Kick", "kick.com") if kick else ("Twitch", "twitch.tv")
-        blocked = channel in excluded or slug in excluded
+        blocked = ct.channel_excluded(channel, excluded)
         live = ct.LIVE.stream_info(channel, "creators") if source["enabled"] else {}
         status = "Excluded" if blocked else "Live" if live else "Enabled" if source["enabled"] else "Disabled"
         capture = moment_button(channel, "creators") if source["enabled"] and not blocked else ""
@@ -1289,7 +1297,7 @@ def creator_channels(request: Request, notice: str = "", error: str = ""):
     feedback = f"<p role=alert>{E(error)}</p>" if error else f"<p role=status>{E(notice)}</p>" if notice else ""
     return page("Creator channels", f"<h2>Creator channels</h2>{feedback}"
                 "<p>Add your own channel or a creator whose content you have permission to clip. "
-                "Enable clipping, then start its live buffer and mark the moment when you want to capture it.</p>"
+                "Enable clipping to buffer the channel when it goes live and capture chat highlights. Use Clip moment to mark a highlight yourself.</p>"
                 "<form class=panel method=post action=/creators/add>"
                 "<label>Platform <select name=platform><option value=twitch>Twitch</option><option value=kick>Kick</option></select></label> "
                 "<label>Channel username or URL <input name=source maxlength=200 required></label> "

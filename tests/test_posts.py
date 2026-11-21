@@ -367,6 +367,47 @@ class PostTests(unittest.TestCase):
                 asyncio.run(live.capture("streamer", 100, 20, 10, {}))
         self.assertEqual([call.args[-3:-1] for call in worker.call_args_list], [(45, 8), (60, 8), (75, 8)])
 
+    def test_all_live_recording_covers_both_workspaces_without_duplicate_or_excluded_buffers(self):
+        live = ct.Live()
+        live.streams = dict.fromkeys(("one", "two", "excluded"), {})
+        live.kick = {"three": {}}
+        live.creator_streams = dict.fromkeys(("one", "four", "kick:five", "disabled"), {})
+        sources = {channel: {"enabled": channel != "disabled"} for channel in live.creator_streams}
+        with (
+            patch.object(ct, "RECORD_MAX", 0),
+            patch.object(ct, "creator_profile", return_value=None),
+            patch.object(ct, "creator_channels", return_value=sources),
+            patch.object(ct, "stored_watchlist", return_value={"exclude": ["twitch:excluded"]}),
+            patch.object(ct, "Recorder", side_effect=lambda *_: Mock()) as recorder,
+        ):
+            live.sync_recorders()
+            self.assertEqual(set(live.rec), {"one", "two", "kick:three", "four", "kick:five"})
+            self.assertEqual(live.creator_buffers, {"four", "kick:five"})
+            self.assertEqual(recorder.call_count, 5)
+            live.sync_recorders()
+            self.assertEqual(recorder.call_count, 5)
+            old = live.rec["four"]
+            sources["four"]["enabled"] = False
+            live.sync_recorders()
+            old.stop.assert_called_once()
+            self.assertNotIn("four", live.rec)
+
+    def test_automatic_creator_capture_stays_in_its_workspace_and_checks_enrollment(self):
+        live = ct.Live()
+        channel = "kick:creator"
+        live.creator_streams[channel] = {"name": "Creator", "game": "Other game", "title": "Other title", "viewers": 1}
+        recorder = Mock(dir=self.path)
+        recorder.cut.return_value = 3
+        live.rec[channel] = recorder
+        with patch.object(ct, "make_clip", return_value="saved") as render:
+            with patch.object(ct, "creator_enabled", return_value=False):
+                self.assertIsNone(live._capture(channel, 100, 50, 15, {}, 45, 8, recorder, workspace="creators"))
+                render.assert_not_called()
+            with patch.object(ct, "creator_enabled", return_value=True):
+                self.assertEqual(live._capture(channel, 100, 50, 15, {}, 45, 8, recorder, workspace="creators"), "saved")
+        item = render.call_args.args[0]
+        self.assertEqual((item["workspace"], item["channel"], item["id"]), ("creators", channel, "creator-live-kick_creator-100"))
+
     def test_twitch_highlight_uses_longer_vod_with_native_fallback(self):
         clip = {"id": "highlight", "duration": 30, "video_id": "123", "vod_offset": 195}
         with patch.object(ct, "make_clip", side_effect=[OSError, "clip-highlight"]) as render:

@@ -11,7 +11,7 @@ Clip Desk is an open-source Windows workspace by [DroMeta](https://x.com/DroMeta
 1. Download the Windows ZIP and extract it to a local folder outside cloud sync.
 2. Run `setup.bat`. You need Windows x64, Python 3.12 or later, and FFmpeg. The setup offers to install tools you are missing.
 3. Run `start.bat` and open **Creator channels**. Add a Twitch or Kick channel, confirm permission, then enable clipping.
-4. Start a live buffer and use **Clip moment** to capture the seconds around a highlight. Open **Creator clips** to review and export.
+4. The buffer starts when the enabled channel goes live. Use **Clip moment** to capture the seconds around a highlight, or let chat activity trigger a clip. Open **Creator clips** to review and export.
 
 See [Windows installation and updates](README.txt) for checksum verification and update instructions. The Windows workspace opens at [127.0.0.1:8788](http://127.0.0.1:8788/today) by default.
 

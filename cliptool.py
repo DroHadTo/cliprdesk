@@ -40,7 +40,7 @@ FONT = os.getenv("FONT", "C\\:/Windows/Fonts/arialbd.ttf")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")   # auto = try CUDA, fall back to CPU int8
 RENDER_WORKERS = threading.BoundedSemaphore(int(os.getenv("RENDER_WORKERS", "2")))
-RECORD_MAX = int(os.getenv("RECORD_MAX", "4"))
+RECORD_MAX = max(0, int(os.getenv("RECORD_MAX", "0")))
 KEYWORDS = {"lul": 1, "kekw": 1, "omegalul": 2, "lmao": 1, "pog": 1, "pogchamp": 1, "poggers": 1,
             "clip": 3, "clipit": 5, "clip it": 5, "holy": 1, "wtf": 1, "monkas": 1, "w": 1, "kekl": 1}
 # always-on chat watch words (merged with the user's own list on the Watchlist page)
@@ -261,6 +261,12 @@ def watchlist():
             settings[field] = list(dict.fromkeys(slug for creator in profile.values() for slug in creator.get(platform, ())
                                                if slug not in excluded and f"{platform}:{slug}" not in excluded))
     return settings
+
+
+def channel_excluded(channel, excluded):
+    slug = channel.removeprefix("kick:")
+    scoped = channel if channel.startswith("kick:") else f"twitch:{channel}"
+    return slug in excluded or scoped in excluded
 
 
 def find_facecam(raw, start, duration, streamer, prior=None):
@@ -927,7 +933,7 @@ class Live:
         except ImportError: log("kick chat off: run setup.bat again to install websockets"); return
         H = {"User-Agent": "Mozilla/5.0", "Origin": "https://kick.com", "Accept": "application/json"}
         while True:
-            if not self.kick: await asyncio.sleep(30); continue
+            if not self.kick_feeds(): await asyncio.sleep(10); continue
             try:
                 cid = str(uuid.uuid4())
                 url = (await asyncio.to_thread(lambda: requests.post("https://web.kick.com/api/v1/realtime/connection", headers=H, timeout=15, json={
@@ -937,9 +943,11 @@ class Live:
                 async with websockets.connect(url, origin="https://kick.com", user_agent_header="Mozilla/5.0") as ws:
                     await ws.send(json.dumps({"id": 1, "connect": {"token": tok, "name": "js"}})); n, subbed, t0 = 2, {}, time.time()
                     while time.time() - t0 < 2400:
-                        want = {f"chatrooms.{k['chatroom']}.v2": slug for slug, k in self.kick.items()}
+                        want = self.kick_feeds()
                         for feed in set(want) - set(subbed):
                             await ws.send(json.dumps({"id": n, "subscribe": {"channel": feed}})); n += 1
+                        for feed in set(subbed) - set(want):
+                            await ws.send(json.dumps({"id": n, "unsubscribe": {"channel": feed}})); n += 1
                         subbed = want
                         try: raw = await asyncio.wait_for(ws.recv(), 30)
                         except asyncio.TimeoutError: continue
@@ -949,32 +957,68 @@ class Live:
                             p = m.get("push", {}); d = p.get("pub", {}).get("data", {})
                             if str(d.get("event", "")).endswith("ChatMessageEvent") and p.get("channel") in subbed:
                                 body = json.loads(d["data"]) if isinstance(d.get("data"), str) else d.get("data", {})
-                                self.hit(f"kick:{subbed[p['channel']]}", body.get("content", ""))
+                                self.hit(subbed[p["channel"]], body.get("content", ""))
             except Exception as e: log("kick chat error", str(e)[:150]); await asyncio.sleep(30)
 
-    async def sync_joins(self):
-        if not self.writer: return
-        want = set(self.streams)
-        for ch in want - self.joined: self.writer.write(f"JOIN #{ch}\r\n".encode())
-        for ch in self.joined - want: self.writer.write(f"PART #{ch}\r\n".encode())
-        await self.writer.drain(); self.joined = want; self.status["channels"] = len(want)
+    def kick_feeds(self):
+        watched = dict(self.creator_streams)
+        watched.update((f"kick:{slug}", stream) for slug, stream in self.kick.items())
+        return {f"chatrooms.{stream['chatroom']}.v2": channel for channel, stream in watched.items()
+                if channel.startswith("kick:") and stream.get("chatroom")}
 
-    def sync_recorders(self, include):
-        profile = creator_profile()
-        enabled = {channel for channel, source in creator_channels().items() if source["enabled"]} if self.creator_buffers else set()
+    async def sync_joins(self):
+        writer = self.writer
+        if not writer or writer.is_closing():
+            return
+        want = set(self.streams) | {ch for ch in self.creator_streams if not ch.startswith("kick:")}
+        for ch in want - self.joined: writer.write(f"JOIN #{ch}\r\n".encode())
+        for ch in self.joined - want: writer.write(f"PART #{ch}\r\n".encode())
+        self.joined = want
+        self.status["channels"] = len(self.streams)
+        try:
+            await writer.drain()
+        except OSError:
+            writer.close()  # IRC reconnects independently of discovery and recording.
+
+    def live_workspaces(self):
+        live = dict.fromkeys(self.creator_streams, "creators")
+        live.update(dict.fromkeys(self.streams, "gta6"))
+        live.update((f"kick:{slug}", "gta6") for slug in self.kick)
+        return live
+
+    def sync_recorders(self):
         with self.record_lock:
             if self.recording_closed:
                 return
-            live = set(self.streams) | {f"kick:{k}" for k in self.kick}
+            profile = creator_profile()
+            enabled = {channel for channel, source in creator_channels().items() if source["enabled"]}
+            excluded = {name.strip().lower() for name in stored_watchlist()["exclude"]}
+            live = self.live_workspaces()
+            for ch in set(live) | set(self.rec):
+                workspace = live.get(ch, "creators" if ch in self.creator_buffers else "gta6")
+                qualified = ch in enabled if workspace == "creators" else creator_channel_allowed(ch, profile)
+                if not qualified or channel_excluded(ch, excluded):
+                    live.pop(ch, None)
+                    self.armed.discard(ch)
             for ch in list(self.rec):
-                allowed = ch in enabled if ch in self.creator_buffers else creator_channel_allowed(ch, profile)
-                if not allowed or (ch not in live and ch not in self.armed) or not self.rec[ch].alive():
+                if (ch not in live and ch not in self.armed) or not self.rec[ch].alive():
                     self.rec.pop(ch).stop()
                     self.armed.discard(ch)
                     self.creator_buffers.discard(ch)
-            for ch in [c for c in include if c in live and c not in self.rec][:max(0, RECORD_MAX - len(self.rec))]:
-                try: self.rec[ch] = Recorder(ch, f"https://kick.com/{ch[5:]}" if ch.startswith("kick:") else None)
-                except Exception as e: log("recorder failed", ch, e)
+            # Prefer the GTA workspace when a live channel appears in both lists.
+            for ch, workspace in sorted(live.items(), key=lambda item: item[1] != "gta6"):
+                if ch not in self.rec:
+                    if RECORD_MAX and len(self.rec) >= RECORD_MAX:
+                        continue
+                    try:
+                        self.rec[ch] = Recorder(ch, f"https://kick.com/{ch[5:]}" if ch.startswith("kick:") else None)
+                    except (OSError, ValueError) as exc:
+                        log("recorder failed", ch, exc)
+                        continue
+                if workspace == "creators":
+                    self.creator_buffers.add(ch)
+                else:
+                    self.creator_buffers.discard(ch)
             self.status["recording"] = len(self.rec)
 
     def stream_info(self, ch, workspace="gta6"):
@@ -993,7 +1037,7 @@ class Live:
         elif workspace != "gta6" or not creator_channel_allowed(ch, creator_profile()):
             raise ValueError("This creator is outside your clip list.")
         excluded = {s.lower() for s in watchlist()["exclude"]}
-        if slug in excluded or ch in excluded:
+        if channel_excluded(ch, excluded):
             raise ValueError("This streamer is excluded on the watchlist.")
         url = f"https://{'kick.com' if kick else 'twitch.tv'}/{slug}"
         with self.record_lock:
@@ -1021,7 +1065,7 @@ class Live:
                 return f"Capturing a {requested}-second clip. The finished video will appear in {destination}."
             if active:
                 self.rec.pop(ch).stop()
-            if len(self.rec) >= RECORD_MAX:
+            if RECORD_MAX and len(self.rec) >= RECORD_MAX:
                 raise ValueError(f"All {RECORD_MAX} recording slots are in use. Try a stream already recording.")
             self.rec[ch] = Recorder(ch, url)
             self.armed.add(ch)
@@ -1057,6 +1101,7 @@ class Live:
                     if live:
                         categories = live.get("categories") or [{}]
                         return ch, {"name": data.get("user", {}).get("username", slug),
+                                    "chatroom": (data.get("chatroom") or {}).get("id"),
                                     "title": live.get("session_title", ""),
                                     "viewers": live.get("viewer_count", 0), "game": categories[0].get("name", "")}
                 except (requests.RequestException, OSError, ValueError, subprocess.TimeoutExpired):
@@ -1066,9 +1111,11 @@ class Live:
         while True:
             excluded = set(watchlist().get("exclude", ()))
             channels = [ch for ch, row in creator_channels().items() if row["enabled"]
-                        and ch not in excluded and ch.removeprefix("kick:") not in excluded]
+                        and not channel_excluded(ch, excluded)]
             pairs = await asyncio.gather(*(lookup(ch) for ch in channels))
             self.creator_streams = {ch: stream for ch, stream in pairs if stream}
+            await asyncio.to_thread(self.sync_recorders)
+            await self.sync_joins()
             await asyncio.sleep(60)
 
     def finish_moment(self, ch, clicked, recorder, item):
@@ -1114,13 +1161,13 @@ class Live:
                                       "name": j.get("user", {}).get("username", slug), "game": ls["categories"][0]["name"]}
                 except Exception as e: log("kick channel error", slug, str(e)[:80])
             self.kick = kick; self.status["kick"] = len(kick)
-            self.sync_recorders(wl["include"] + [f"kick:{k}" for k in wl.get("kick_include", [])])  # record in list order, up to RECORD_MAX
+            await asyncio.to_thread(self.sync_recorders)
             await asyncio.sleep(60)
 
     async def detect(self):
         while True:
             await asyncio.sleep(BUCKET); now = time.time()
-            for ch in list(self.streams) + [f"kick:{k}" for k in self.kick]:
+            for ch, workspace in self.live_workspaces().items():
                 n = self.counts.pop(ch, 0.0); h = self.hist[ch]; wc = self.wc.pop(ch, {})
                 avg = self.wavg[ch]; burst = {w: c for w, c in wc.items() if c >= max(self.word_min, avg[w] * 2.5)}
                 for w in set(avg) | set(wc): avg[w] = avg[w] * 0.85 + wc.get(w, 0) * 0.15
@@ -1129,7 +1176,7 @@ class Live:
                     self.last[ch] = now; self.status["spikes"] += 1; self.pending.pop(ch, None)
                     self.status["last_spike"] = f"{ch} {datetime.now():%H:%M:%S} chat word '{top[0]}' x{top[1]}"
                     log("WORD", self.status["last_spike"]); kws = dict(self.kw[ch]); kws[top[0]] = top[1]
-                    asyncio.create_task(self.capture(ch, now - BUCKET / 2, n, statistics.mean(h) if h else 0, kws))
+                    asyncio.create_task(self.capture(ch, now - BUCKET / 2, n, statistics.mean(h) if h else 0, kws, workspace=workspace))
                     h.append(n); self.kw[ch].clear(); continue
                 if ch in self.pending:  # sustain: the next bucket must stay hot, or it was one emote wave
                     t, n0, mu, kws = self.pending.pop(ch)
@@ -1137,47 +1184,58 @@ class Live:
                         self.last[ch] = now; self.status["spikes"] += 1
                         self.status["last_spike"] = f"{ch} {datetime.fromtimestamp(t):%H:%M:%S} score {n0:.0f} vs {mu:.1f}"
                         log("SPIKE", self.status["last_spike"], kws)
-                        asyncio.create_task(self.capture(ch, t, n0, mu, kws))
+                        asyncio.create_task(self.capture(ch, t, n0, mu, kws, workspace=workspace))
                 elif now - self.last[ch] > 90 and now > self.quiet[ch] and (is_spike(n, h) or (
                         now - self.last[ch] > DROUGHT and len(h) >= 6 and n >= max(6, statistics.mean(h) * 1.4))):
                     self.pending[ch] = (now - BUCKET / 2, n, statistics.mean(h), dict(self.kw[ch]))
                 h.append(n); self.kw[ch].clear()
 
-    async def capture(self, ch, t, n, mu, kws):
+    async def capture(self, ch, t, n, mu, kws, *, workspace="gta6"):
         import growth, research
         capture_id = f"{ch}:{int(t)}"
-        length = growth.choose_length(next(self.auto_lengths), capture_id)
+        length = next(self.auto_lengths)
+        if workspace == "gta6":
+            length = growth.choose_length(length, capture_id)
         recorder = self.rec.get(ch)
         before = AUTO_CLIP_LEAD
         if recorder and recorder.started <= t:
-            before = research.opening_lead(capture_id, before)
+            if workspace == "gta6":
+                before = research.opening_lead(capture_id, before)
             before = min(before, int(t - recorder.started))
             wait = max(0, t + length - before + SEG + 3 - time.time())
         else:
+            if workspace == "creators":
+                return
             recorder, wait = None, 90  # give Twitch time to publish an available highlight or VOD segment
         await asyncio.sleep(wait)
-        await asyncio.to_thread(self._capture, ch, t, n, mu, kws, length, before, recorder)
+        await asyncio.to_thread(self._capture, ch, t, n, mu, kws, length, before, recorder, workspace=workspace)
 
-    def _capture(self, ch, t, n, mu, kws, length, before, recorder):
-        if not creator_channel_allowed(ch, creator_profile()):
+    def _capture(self, ch, t, n, mu, kws, length, before, recorder, *, workspace="gta6"):
+        allowed = creator_enabled(ch) if workspace == "creators" else creator_channel_allowed(ch, creator_profile())
+        if not allowed or channel_excluded(ch, {name.lower() for name in stored_watchlist()["exclude"]}):
             return
         kick = ch.startswith("kick:")
-        s = self.kick.get(ch[5:]) if kick else self.streams.get(ch)
+        s = self.stream_info(ch, workspace)
         if not s: return
         name = s["name"] if kick else s["user_name"]
-        if used_today(db()).get(name.lower(), 0) >= MAX_PER: log("live: daily cap for", ch); return
+        with closing(db()) as conn:
+            if used_today(conn, workspace).get(name.lower(), 0) >= MAX_PER:
+                log("live: daily cap for", ch)
+                return
         spike = {"score": round(n), "baseline": round(mu, 1), "keywords": kws, "at": datetime.fromtimestamp(t).isoformat(timespec="seconds")}
         base = dict(source="live-spike", streamer=name, platform="Kick" if kick else "Twitch", spike=spike,
+                    workspace=workspace, channel=ch,
                     game=s["game"] if kick else s["game_name"], title=s["title"], views=s["viewers"] if kick else s["viewer_count"],
                     url=f"https://kick.com/{ch[5:]}" if kick else f"https://twitch.tv/{ch}")
         try:
             if recorder and self.rec.get(ch) in (None, recorder):
-                out = DATA / "buffer" / f"{ch.replace(':', '_')}-{int(t)}.mp4"
+                out = recorder.dir / f"{ch.replace(':', '_')}-{int(t)}.mp4"
                 try:
                     off = recorder.cut(t, out, before, length - before)
                     if off is not None:
-                        opening = {4: "tight", AUTO_CLIP_LEAD: "standard"}.get(before, "")
-                        clip_id = make_clip(dict(base, id=f"live-{ch.replace(':', '_')}-{int(t)}", source="live-buffer",
+                        opening = {4: "tight", AUTO_CLIP_LEAD: "standard"}.get(before, "") if workspace == "gta6" else ""
+                        prefix = "creator-live" if workspace == "creators" else "live"
+                        clip_id = make_clip(dict(base, id=f"{prefix}-{ch.replace(':', '_')}-{int(t)}", source="live-buffer",
                                                  local=str(out), start=off, dur=length, peak=before,
                                                  spike=spike | {"opening_test": opening}))
                         if clip_id:
@@ -1186,7 +1244,9 @@ class Live:
                     log("live buffer unavailable", ch, type(e).__name__)
                 finally:
                     out.unlink(missing_ok=True)
-            if kick or not s.get("user_id"): log("live: spike but not recording (add to watchlist top / raise RECORD_MAX)", ch); return
+            if workspace == "creators":
+                return
+            if kick or not s.get("user_id"): log("live: spike but recording unavailable", ch); return
             st = datetime.fromtimestamp(t - 120, timezone.utc)
             clips = [x for x in helix("clips", broadcaster_id=s["user_id"], started_at=iso(st), ended_at=iso(datetime.now(timezone.utc)), first=20)["data"] if x["duration"] >= 7]
             if clips:

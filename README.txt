@@ -1,4 +1,5 @@
-Clip Desk for Windows
+Clip Desk for Windows by DroMeta
+Copyright (c) 2026 DroMeta (DroHadTo on GitHub). See LICENSE.
 
 1. Extract the folder to a local path outside OneDrive, Dropbox, or other sync services.
 2. Install 64-bit Python 3.12 or newer and FFmpeg, or use the offers in setup.bat.

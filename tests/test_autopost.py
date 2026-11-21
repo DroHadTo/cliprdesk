@@ -220,6 +220,45 @@ class AutomaticPostingTests(unittest.TestCase):
         upload.assert_not_called()
         self.assertEqual(self.job()["state"], "review")
 
+    def test_quiet_hour_uses_highest_eligible_fallback_and_consumes_one_regular_slot(self):
+        self.connect()
+        for cid in ("lower", "highest", "no-grant", "preliminary"):
+            self.add_clip(cid, f"The {cid} taxi suddenly found a new route across the plaza.")
+        with posts.transaction() as conn:
+            conn.execute("""UPDATE clip_virality SET state=CASE WHEN clip_id='preliminary' THEN 'preliminary' ELSE 'fallback' END,
+                         score=CASE clip_id WHEN 'highest' THEN 80 WHEN 'lower' THEN 76 ELSE 99 END,
+                         calibration=CASE WHEN clip_id='lower' THEN 9 ELSE 0 END""")
+            conn.execute("UPDATE clips SET source='live-buffer'")
+            conn.execute("DELETE FROM creator_permissions WHERE subject='no-grant'")
+        job = autopost.claim()
+        self.assertEqual((job["clip_id"], job["post_mode"]), ("highest", "fallback"))
+        with (
+            patch.object(autopost.requests, "put", return_value=Mock(status_code=200)),
+            patch.object(autopost, "buffer_query", return_value={"createPost": {"post": self.sent_post()}}),
+        ):
+            autopost.upload_and_publish(job)
+        self.assertIsNone(autopost.claim())
+        with closing(ct.db()) as conn:
+            self.assertEqual(posts.recent_post_modes(conn), (1, 0))
+
+    def test_priority_posts_preempt_fallback_and_manual_post_can_close_quiet_hour(self):
+        self.connect()
+        self.add_clip("fallback")
+        self.add_clip("priority", "The boat just outran every car on the upper bridge.")
+        with posts.transaction() as conn:
+            conn.execute("UPDATE clip_virality SET state='fallback',score=81 WHERE clip_id='fallback'")
+        self.assertEqual(autopost.claim()["clip_id"], "priority")
+        with posts.transaction() as conn:
+            conn.execute("UPDATE tiktok_uploads SET state='failed' WHERE clip_id='priority'")
+        job = autopost.claim()
+        self.assertEqual(job["post_mode"], "fallback")
+        self.make_due()
+        with posts.transaction() as conn:
+            conn.execute("INSERT INTO clips(id,posted) VALUES('manual',?)", (datetime.now(timezone.utc).isoformat(),))
+        self.assertIsNone(autopost.claim())
+        with closing(ct.db()) as conn:
+            self.assertEqual(conn.execute("SELECT state FROM tiktok_uploads WHERE clip_id='fallback'").fetchone()[0], "review")
+
     def test_request_and_storage_budgets_reject_before_network(self):
         with patch.object(autopost, "BUFFER_REQUEST_LIMIT", 1):
             autopost.reserve_buffer_request()

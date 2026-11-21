@@ -12,6 +12,8 @@ SOURCE = STATIC / "GTA6cliptool-source.zip"
 LOCAL = "http://127.0.0.1:8788/creators"
 REPOSITORY = "https://github.com/DroHadTo/cliprdesk"
 LICENSE = f"{REPOSITORY}/blob/main/LICENSE"
+CREATOR = "https://x.com/DroMeta"
+WORKFLOW = f"{REPOSITORY}/blob/main/WORKFLOWS.md"
 PAGES = (("/", "Overview"), ("/gta6", "GTA 6"), ("/downloads", "Download"), ("/security", "Privacy and rights"))
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -39,14 +41,16 @@ def page(title, path, content):
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#10121a">
         <meta name="description" content="Clip Desk is an open-source Windows workspace for capturing, editing and publishing vertical livestream clips.">
-        <title>{title} | Clip Desk</title><link rel="stylesheet" href="/clipdesk.css?v=2"></head>
+        <meta name="author" content="DroMeta">
+        <title>{title} | Clip Desk</title><link rel="stylesheet" href="/clipdesk.css?v=3"></head>
         <body class="public-site"><a class="skip-link" href="#content">Skip to content</a>
         <header class="public-head"><div class="windowbar">
         <a href="/" class="brand"><span class="brand-mark" aria-hidden="true"></span>Clip Desk</a>
         <nav class="public-nav" aria-label="Site">{links}</nav></div></header>
         <main class="public-main" id="content">{content}</main>
-        <footer class="public-foot"><div><strong>Clip Desk</strong><small>An independent tool for livestream creators.</small></div>
-        <nav aria-label="Project"><a href="{REPOSITORY}">GitHub</a><a href="{LICENSE}">MIT License</a><a href="/security">Privacy and rights</a></nav>
+        <footer class="public-foot"><div><strong>Clip Desk</strong><small>&copy; 2026 <a href="{CREATOR}">DroMeta</a></small></div>
+        <nav aria-label="Project"><a href="{REPOSITORY}">GitHub</a><a href="{WORKFLOW}">Workflow guide</a>
+        <a href="{LICENSE}">MIT License</a><a href="/security">Privacy and rights</a></nav>
         </footer></body></html>"""
     )
 
@@ -63,10 +67,13 @@ def edit_preview(*, gta=False):
               <div class="preview-caption">{caption}</div>
             </div>
             <div class="preview-timeline">
+              <strong>Timeline</strong>
               <div class="preview-scale"><span>00:00</span><span>00:45</span></div>
-              <span class="preview-track footage">Video</span>
-              <span class="preview-track reaction">Facecam</span>
-              <span class="preview-track subtitles">Captions</span>
+              <div class="preview-tracks">
+                <span class="preview-track footage">Video</span>
+                <span class="preview-track reaction">Facecam</span>
+                <span class="preview-track subtitles">Captions</span>
+              </div>
             </div>
           </div>
           <figcaption>Workflow preview with illustrative footage</figcaption>
@@ -83,12 +90,13 @@ def home():
         <p class="hero-description">Turn Twitch and Kick streams into vertical clips with the reaction, the game and the captions in frame.</p>
         <div class="actions"><a class="btn" href="/downloads">Download for Windows</a>
         <a class="btn secondary" href="{REPOSITORY}">View on GitHub <span aria-hidden="true">↗</span></a></div>
-        <p class="hero-meta"><a href="{LICENSE}">MIT-licensed software</a><span aria-hidden="true">·</span>
+        <p class="hero-meta"><a href="{LICENSE}">MIT-licensed software</a>
         <a href="{LOCAL}">Open local workspace</a></p></div>
         {edit_preview()}
       </section>
       <section aria-labelledby="workflow-title">
-        <h2 id="workflow-title" class="section-title">Capture, review and publish</h2>
+        <div class="section-heading"><h2 id="workflow-title" class="section-title">Capture, review and publish</h2>
+        <a href="{WORKFLOW}">Workflow guide</a></div>
         <div class="feature-grid">
         <article class="card"><h3>Capture around the moment</h3><p>Enable your own channel or a creator you have permission to clip.
         Buffer a livestream and capture the seconds around the moment you mark.</p></article>
@@ -139,7 +147,7 @@ def downloads():
     source = '<a href="/downloads/source.zip">Download source ZIP</a>' if SOURCE.is_file() else ""
     return page("Download", "/downloads", f"""
       <h1 class="page-title">Download Clip Desk</h1>
-      <section class="panel"><h2>Complete Windows package</h2>
+      <section class="panel download-package"><h2>Complete Windows package</h2>
       <p>Free download. Includes the capture worker, facecam tools, captions, editor exports,
       clip scoring, research, Buffer and R2 publishing, and Whop integration.</p>{release}</section>
       <section class="panel"><h2>Open-source software</h2>

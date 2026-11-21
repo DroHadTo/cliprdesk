@@ -1,8 +1,8 @@
 # Clip Desk
 
-Clip Desk is an open-source Windows workspace for capturing, editing, and publishing vertical clips from Twitch and Kick. Capture a live moment, review the facecam and captions, and export a finished 9:16 video.
+Clip Desk is an open-source Windows workspace by [DroMeta](https://x.com/DroMeta) for capturing, editing, and publishing vertical clips from Twitch and Kick. Capture a live moment, review the facecam and captions, and export a finished 9:16 video.
 
-[Download for Windows](https://cliprdesk.vercel.app/downloads) ? [Workflow guide](WORKFLOWS.md) ? [Security policy](SECURITY.md) ? [MIT License](LICENSE)
+[Download for Windows](https://cliprdesk.vercel.app/downloads) | [Workflow guide](WORKFLOWS.md) | [Security policy](SECURITY.md) | [MIT License](LICENSE)
 
 ![Illustrated Clip Desk preview showing an original street-racing scene](web/static/preview.webp)
 
@@ -43,4 +43,4 @@ Preview the public site with `python -m uvicorn web.app:app --host 127.0.0.1 --p
 
 ## License
 
-Copyright ? 2026 DroHadTo. The original Clip Desk code is licensed under the [MIT License](LICENSE). Retain the copyright and license notice when distributing it. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for bundled components. Footage, music, names, and trademarks are covered by their respective rights and permissions.
+Copyright (c) 2026 DroMeta (DroHadTo on GitHub). The original Clip Desk code is licensed under the [MIT License](LICENSE). Retain the copyright and license notice when distributing it. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for bundled components. Footage, music, names, and trademarks are covered by their respective rights and permissions.

@@ -281,7 +281,7 @@ def prior_score_baseline(conn, channel, score, now):
 
 def trial_results(rows, target):
     summary = {}
-    for mode in ("regular", "experiment"):
+    for mode in ("regular", "experiment", "fallback"):
         posts_with_score = [row for row in rows if row["post_mode"] == mode]
         measured = [row for row in posts_with_score if row["checkpoint_views"] is not None]
         forecast = [row for row in measured if row["expected_views"] is not None]

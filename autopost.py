@@ -271,6 +271,9 @@ def claim():
                 conn.execute("UPDATE tiktok_uploads SET state='review',detail='Waiting for quality review and a clip-specific caption.',run_after=0 WHERE clip_id=?",
                              (active["clip_id"],))
                 return None
+            if active["state"] == "uploading" and active["post_mode"] == "fallback" and not room["fallback"]:
+                defer_fallback(conn, active["clip_id"])
+                return None
             if (active["run_after"] > now or active["state"] == "confirmation"
                     or (active["state"] == "uploading" and (not settings["enabled"] or not delivery))):
                 return None
@@ -283,21 +286,26 @@ def claim():
                 or not any(room.values())):
             return None
         candidates = conn.execute(f"""SELECT c.id,c.game,c.streamer,c.url,k.caption,k.angle,v.score,v.event,
-            CASE WHEN v.score>=? THEN 'regular' ELSE 'experiment' END AS post_mode,
+            CASE WHEN v.state='fallback' THEN 'fallback'
+                 WHEN v.score>=? THEN 'regular' ELSE 'experiment' END AS post_mode,
             CASE WHEN json_valid(c.spike) THEN unixepoch(json_extract(c.spike,'$.at')) END AS event_time
             FROM clips c
             JOIN clip_quality q ON q.clip_id=c.id AND q.state='approved'
             JOIN clip_publish_captions k ON k.clip_id=c.id AND k.stamp=q.stamp AND k.caption<>''
-            JOIN clip_virality v ON v.clip_id=c.id AND v.stamp=q.stamp AND v.state='verified'
+            JOIN clip_virality v ON v.clip_id=c.id AND v.stamp=q.stamp
             LEFT JOIN post_drafts p ON p.clip_id=c.id LEFT JOIN tiktok_uploads u ON u.clip_id=c.id
             WHERE {allowed} AND c.posted IS NULL AND c.file<>'' AND (p.reserved_day IS NULL OR p.reserved_day<>?)
               AND {WAITING_UPLOAD}
               AND NOT EXISTS (SELECT 1 FROM takedowns t WHERE t.clip_id=c.id)
-              AND ((? AND v.score>=?) OR (? AND v.score>=? AND v.score<?))
-            ORDER BY post_mode='regular' DESC,v.score+v.calibration DESC,v.score DESC,c.rowid DESC""",
+              AND ((v.state='verified' AND ((? AND v.score>=?) OR (? AND v.score>=? AND v.score<?)))
+                   OR (v.state='fallback' AND ?))
+            ORDER BY CASE post_mode WHEN 'regular' THEN 0 WHEN 'experiment' THEN 1 ELSE 2 END,
+                     CASE post_mode WHEN 'fallback' THEN v.score ELSE v.score+v.calibration END DESC,
+                     v.score DESC,c.rowid DESC""",
                                   (virality.MIN_PUBLISH_SCORE, *params, posts.posting_day(), OLD_MEDIA_ERROR,
                                    room["regular"], virality.MIN_PUBLISH_SCORE, room["experiment"],
-                                   virality.MIN_EXPERIMENT_SCORE, virality.MIN_PUBLISH_SCORE)).fetchall()
+                                   virality.MIN_EXPERIMENT_SCORE, virality.MIN_PUBLISH_SCORE,
+                                   room["fallback"])).fetchall()
         channel = settings["channel"]
         for clip in candidates:
             clip_id = clip["id"]
@@ -334,7 +342,14 @@ def claim():
 
 def hourly_room(conn, now=None):
     regular, experiments = posts.recent_post_modes(conn, now)
-    return {"regular": regular < posts.HOURLY_LIMIT, "experiment": experiments < posts.EXPERIMENT_HOURLY_LIMIT}
+    return {"regular": regular < posts.HOURLY_LIMIT, "experiment": experiments < posts.EXPERIMENT_HOURLY_LIMIT,
+            "fallback": regular + experiments == 0}
+
+
+def defer_fallback(conn, clip_id):
+    conn.execute("""UPDATE tiktok_uploads SET state='review',run_after=0,
+                   detail='Another post filled the quiet hour. Waiting for the next opening.'
+                   WHERE clip_id=? AND state='uploading'""", (clip_id,))
 
 
 def similar_moment_posted(conn, clip):
@@ -397,7 +412,7 @@ def upload_and_publish(job):
     with closing(ct.db()) as conn:
         if not conn.execute(current, (clip_id, *params)).fetchone():
             return
-    if not posts.strong_audience(job):
+    if job["post_mode"] != "fallback" and not posts.strong_audience(job):
         detail = "The moment needs a stronger audience response for automatic posting."
         with posts.transaction() as conn:
             conn.execute("UPDATE clip_quality SET state='held',score=NULL,detail=? WHERE clip_id=?", (detail, clip_id))
@@ -438,7 +453,11 @@ def upload_and_publish(job):
                             WHERE clip_id=? AND state='uploading'""", (clip_id,))
             return
         settings = conn.execute("SELECT enabled FROM tiktok_automation WHERE id=1").fetchone()
-        if (not settings or not settings["enabled"] or not hourly_room(conn)[job["post_mode"]]
+        room = hourly_room(conn)
+        if job["post_mode"] == "fallback" and not room["fallback"]:
+            defer_fallback(conn, clip_id)
+            return
+        if (not settings or not settings["enabled"] or not room[job["post_mode"]]
                 or sum(posts.budget(conn, posts.posting_day())) > posts.DAILY_LIMIT):
             conn.execute("UPDATE tiktok_uploads SET asset_url=?,run_after=0 WHERE clip_id=?", (asset_url, clip_id))
             return

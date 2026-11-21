@@ -99,3 +99,30 @@ class QualityTests(unittest.TestCase):
                     quality.evaluate(row, path, stamp)
                 self.assertEqual(model.call_count, 2)
                 self.assertEqual((save.call_args.args[2], save.call_args.kwargs["viral_score"]), (expected, 82))
+
+    def test_qualified_footage_can_pass_quiet_hour_without_strong_audience(self):
+        row = {"id": "clip", "source": "daily-top", "views": 500, "channel": "channel", "pick": "split"}
+        scene = "A motorcycle hits a parked taxi."
+        review = {"opening": 4, "payoff": 4, "clarity": 5, "facecam": True, "reason": "crash", "scene": scene}
+        evidence = {"opening": "active", "event": "crash", "scene": scene,
+                    "caption": "That motorcycle just turned the taxi into an optional side quest."}
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "clip.mp4"
+            path.touch()
+            stamp = path.stat().st_mtime_ns
+            with (
+                patch.object(quality, "source_edit", return_value=stamp),
+                patch.object(quality, "save") as save,
+                patch("quality.ct.db"),
+                patch("posts.contact_sheet", return_value="frames"),
+                patch("posts.publish_history", return_value=[]),
+                patch("posts.ask_ollama", side_effect=[review, evidence]) as model,
+                patch("growth.choose_caption_angle", return_value="action"),
+                patch("growth.virality_calibration", return_value=0),
+                patch("research.hypothesis", return_value=""),
+            ):
+                quality.evaluate(row, path, stamp, allow_fallback=True)
+            self.assertEqual(model.call_count, 2)
+            self.assertEqual(save.call_args.args[2], "approved")
+            self.assertTrue(save.call_args.kwargs["fallback"])
+            self.assertLess(save.call_args.kwargs["viral_score"], 82)

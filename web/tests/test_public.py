@@ -51,6 +51,7 @@ class PublicSiteTests(TestCase):
         self.assertIn("127.0.0.1:8788/creators", home.text)
         self.assertIn('href="https://github.com/DroHadTo/cliprdesk">View on GitHub', home.text)
         self.assertIn('href="https://github.com/DroHadTo/cliprdesk/blob/main/LICENSE"', home.text)
+        self.assertIn('&copy; 2026 <a href="https://x.com/DroMeta">DroMeta</a>', home.text)
         self.assertNotIn(">GTA VI</div>", home.text)
         gta = self.client.get("/gta6")
         self.assertEqual(gta.status_code, 200)

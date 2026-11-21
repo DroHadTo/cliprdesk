@@ -4,7 +4,7 @@ from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -38,10 +38,11 @@ class DesktopTests(TestCase):
         self.assertIn("Latest videos and posts", second.text)
 
     def test_legacy_schema_migrates_once_and_preserves_data(self):
-        legacy = ct.SCHEMA.replace(", workspace text not null default 'gta6'", "")
+        legacy = ct.SCHEMA.replace(", workspace text not null default 'gta6'", "").replace(",'fallback'", "")
         with closing(sqlite3.connect(ct.DB)) as conn, conn:
             conn.executescript(legacy)
             conn.execute("INSERT INTO clips(id) VALUES('legacy')")
+            conn.execute("INSERT INTO tiktok_post_trials VALUES('legacy','channel','experiment',84,'chase',1000,5)")
 
         def lookup(_):
             with closing(ct.db()) as conn:
@@ -51,6 +52,26 @@ class DesktopTests(TestCase):
             self.assertEqual(list(pool.map(lookup, range(2))), [("gta6", None, None, None)] * 2)
         with patch.object(ct, "migrate_schema", side_effect=AssertionError("schema already initialized")):
             self.assertEqual(lookup(0)[0], "gta6")
+        with closing(ct.db()) as conn, conn:
+            self.assertEqual(conn.execute("SELECT * FROM tiktok_post_trials").fetchone()["mode"], "experiment")
+            conn.execute("UPDATE tiktok_post_trials SET mode='fallback' WHERE clip_id='legacy'")
+
+    def test_recorders_never_reuse_segment_files_and_failed_launch_stops_streamlink(self):
+        with patch.dict("os.environ", {"LOCALAPPDATA": str(ct.DATA)}):
+            writer = Mock()
+            writer.poll.return_value = None
+            with patch.object(ct.subprocess, "Popen", side_effect=[writer, FileNotFoundError()]):
+                with self.assertRaisesRegex(ValueError, "FFmpeg could not start"):
+                    ct.Recorder("streamer")
+            writer.kill.assert_called_once()
+            writer.stdout.close.assert_called_once()
+            with patch.object(ct.subprocess, "Popen", side_effect=[Mock(), Mock(), Mock(), Mock()]):
+                first = ct.Recorder("streamer")
+                second = ct.Recorder("streamer")
+                self.addCleanup(first.buffer.cleanup)
+                self.addCleanup(second.buffer.cleanup)
+            self.assertNotEqual(first.dir, second.dir)
+            self.assertTrue(first.dir.is_dir() and second.dir.is_dir())
 
     def test_desktop_policies_keep_scripts_external_and_writes_local(self):
         page = self.client.get("/creators")

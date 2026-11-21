@@ -57,7 +57,10 @@ def log(*a):
 def today(): return datetime.now().strftime("%Y-%m-%d")
 
 # ---------------- store ----------------
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+TRIAL_SCHEMA = """create table if not exists tiktok_post_trials(clip_id text primary key, channel text not null,
+  mode text not null check(mode in ('regular','experiment','fallback')), score integer not null,
+  event text not null, expected_views integer, baseline_samples integer not null);"""
 SCHEMA = """
 create table if not exists clips(id text primary key, day text, created text, source text, streamer text,
   title text, views int, url text, game text, file text, hook text, caption text, hashtags text, credit text,
@@ -127,9 +130,7 @@ create table if not exists clip_virality(clip_id text primary key, stamp integer
 create table if not exists tiktok_caption_receipts(clip_id text primary key, channel text not null,
   caption text not null, angle text not null, created real not null);
 create index if not exists tiktok_caption_recent on tiktok_caption_receipts(channel,created desc);
-create table if not exists tiktok_post_trials(clip_id text primary key, channel text not null,
-  mode text not null check(mode in ('regular','experiment')), score integer not null,
-  event text not null, expected_views integer, baseline_samples integer not null);
+""" + TRIAL_SCHEMA + """
 create table if not exists growth_milestones(channel text not null, target integer not null,
   reached real not null, hits integer not null, samples integer not null, primary key(channel,target));
 create table if not exists buffer_requests(at real not null);
@@ -149,6 +150,12 @@ def migrate_schema(conn):
             conn.execute(f"ALTER TABLE clips ADD COLUMN {name} {definition}")
     if "caption_style" not in {row["name"] for row in conn.execute("PRAGMA table_info(post_drafts)")}:
         conn.execute("ALTER TABLE post_drafts ADD COLUMN caption_style integer not null default 0")
+    trial_sql = conn.execute("SELECT sql FROM sqlite_master WHERE name='tiktok_post_trials'").fetchone()[0]
+    if "'fallback'" not in trial_sql:
+        conn.execute("ALTER TABLE tiktok_post_trials RENAME TO tiktok_post_trials_previous")
+        conn.execute(TRIAL_SCHEMA)
+        conn.execute("INSERT INTO tiktok_post_trials SELECT * FROM tiktok_post_trials_previous")
+        conn.execute("DROP TABLE tiktok_post_trials_previous")
     conn.execute("CREATE INDEX IF NOT EXISTS clips_workspace_recent ON clips(workspace, created)")
     conn.execute("CREATE INDEX IF NOT EXISTS clips_workspace_day ON clips(workspace, day, created)")
     conn.execute("CREATE INDEX IF NOT EXISTS takedowns_clip ON takedowns(clip_id)")
@@ -789,21 +796,51 @@ class Recorder:
     """streamlink -> ffmpeg segment muxer ring buffer. Started when a watched streamer goes live."""
     def __init__(self, login, url=None):
         self.started = time.time()
-        self.dir = DATA / "buffer" / str(PORT) / login.replace(":", "_")
-        self.dir.mkdir(parents=True, exist_ok=True)
-        for f in self.dir.glob("*.ts"): f.unlink(missing_ok=True)
-        self.sl = subprocess.Popen([streamlink_bin(), "--stdout", "--twitch-disable-ads", url or f"https://twitch.tv/{login}", "720p60,720p,best"],
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=NOWIN)
-        self.ff = subprocess.Popen([FFMPEG, "-loglevel", "error", "-i", "pipe:0", "-c", "copy", "-f", "segment", "-segment_time", str(SEG),
-                                    "-segment_wrap", str(WRAP), "-reset_timestamps", "1", str(self.dir / "seg%03d.ts")],
-                                   stdin=self.sl.stdout, stderr=subprocess.DEVNULL, creationflags=NOWIN)
+        base = Path(os.environ["LOCALAPPDATA"]) / "ClipDesk" if os.getenv("LOCALAPPDATA") else DATA
+        root = base / "buffer" / str(PORT)
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            self.buffer = TemporaryDirectory(prefix=f"{login.replace(':', '_')}-", dir=root, ignore_cleanup_errors=True)
+        except OSError as exc:
+            raise ValueError("Windows could not create the recording folder. Check available disk space and write permissions.") from exc
+        self.dir = Path(self.buffer.name)
+        try:
+            self.sl = subprocess.Popen(
+                [streamlink_bin(), "--stdout", "--twitch-disable-ads", url or f"https://twitch.tv/{login}", "720p60,720p,best"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=NOWIN,
+            )
+        except OSError as exc:
+            self.buffer.cleanup()
+            raise ValueError("Streamlink could not start. Run Clip Desk Setup to repair the streaming tools.") from exc
+        try:
+            self.ff = subprocess.Popen(
+                [FFMPEG, "-nostdin", "-loglevel", "error", "-i", "pipe:0", "-c", "copy",
+                 "-f", "segment", "-segment_time", str(SEG), "-segment_wrap", str(WRAP),
+                 "-reset_timestamps", "1", str(self.dir / "seg%03d.ts")],
+                stdin=self.sl.stdout, stderr=subprocess.DEVNULL, creationflags=NOWIN,
+            )
+        except OSError as exc:
+            self.stop_process(self.sl)
+            self.buffer.cleanup()
+            raise ValueError("FFmpeg could not start. Check the FFmpeg installation or configured path.") from exc
+        finally:
+            self.sl.stdout.close()
         log("recording", login)
 
     def alive(self): return self.sl.poll() is None and self.ff.poll() is None
+
+    @staticmethod
+    def stop_process(process):
+        try:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     def stop(self):
-        for p in (self.sl, self.ff):
-            try: p.kill()
-            except Exception: pass
+        self.stop_process(self.sl)
+        self.stop_process(self.ff)
 
     def segments(self):
         segments = []
@@ -849,6 +886,7 @@ class Live:
         self.streams = {}; self.kick = {}; self.joined = set(); self.writer = None; self.rec = {}
         self.status = {"channels": 0, "kick": 0, "recording": 0, "spikes": 0, "last_spike": None}
         self.record_lock = threading.Lock()
+        self.recording_closed = False
         self.armed = set()
         self.creator_buffers = set()
         self.creator_streams = {}
@@ -925,6 +963,8 @@ class Live:
         profile = creator_profile()
         enabled = {channel for channel, source in creator_channels().items() if source["enabled"]} if self.creator_buffers else set()
         with self.record_lock:
+            if self.recording_closed:
+                return
             live = set(self.streams) | {f"kick:{k}" for k in self.kick}
             for ch in list(self.rec):
                 allowed = ch in enabled if ch in self.creator_buffers else creator_channel_allowed(ch, profile)
@@ -957,6 +997,8 @@ class Live:
             raise ValueError("This streamer is excluded on the watchlist.")
         url = f"https://{'kick.com' if kick else 'twitch.tv'}/{slug}"
         with self.record_lock:
+            if self.recording_closed:
+                raise ValueError("The recorder is shutting down. Reopen Clip Desk and try again.")
             requested = length or CLIP_LENGTHS[self.manual_length_index]
             before = lead_seconds(requested)
             active = self.rec.get(ch)
@@ -1160,8 +1202,21 @@ class Live:
         except Exception as e: log("live capture failed", ch, e)
 
     async def run(self):
-        await asyncio.gather(self.poll_streams(), self.poll_creators(), self.detect(),
-                             self.kick_chat(), self.irc(), return_exceptions=True)  # keep provider loops independent
+        try:
+            await asyncio.gather(self.poll_streams(), self.poll_creators(), self.detect(),
+                                 self.kick_chat(), self.irc(), return_exceptions=True)
+        finally:
+            self.close_recorders()
+
+    def close_recorders(self):
+        with self.record_lock:
+            self.recording_closed = True
+            for recorder in self.rec.values():
+                recorder.stop()
+            self.rec.clear()
+            self.armed.clear()
+            self.creator_buffers.clear()
+            self.status["recording"] = 0
 
 LIVE = Live()
 

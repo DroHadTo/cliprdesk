@@ -22,6 +22,7 @@ import virality
 
 MIN_SCORE = 84
 VIRALITY_HOLD = "The combination of footage and audience response missed the virality threshold."
+AUDIENCE_HOLD = "The moment needs a stronger audience response for automatic posting."
 OLD_CAPTION_HOLD = "The clip needs a distinct caption grounded in the footage."
 CAPTION_HOLD = "The footage passed. None of the rewritten captions passed the scene and originality checks."
 CONNECT_RETRY_SECONDS = 180
@@ -168,7 +169,7 @@ def source_edit(row, path, stamp):
 
 
 def save(clip_id, stamp, state, score, detail, delay=0, *, caption="", angle="", scene="",
-         viral_score=None, event="", calibration=0):
+         viral_score=None, event="", calibration=0, fallback=False):
     with posts.transaction() as conn:
         conn.execute("INSERT OR REPLACE INTO clip_quality VALUES(?,?,?,?,?,?,?)",
                      (clip_id, stamp, state, score, detail, time.time(), time.time() + delay))
@@ -180,7 +181,7 @@ def save(clip_id, stamp, state, score, detail, delay=0, *, caption="", angle="",
                          (caption, scene, posts.CAPTION_STYLE, clip_id))
         else:
             conn.execute("DELETE FROM clip_publish_captions WHERE clip_id=?", (clip_id,))
-        viral_state = {"approved": "verified", "held": "held"}.get(state, "preliminary")
+        viral_state = {"approved": "fallback" if fallback else "verified", "held": "held"}.get(state, "preliminary")
         virality.record_result(conn, clip_id, stamp, viral_state, viral_score, event, calibration)
 
 
@@ -229,9 +230,10 @@ def publish_caption(model, evidence, previous):
     return ""
 
 
-def evaluate(row, path, stamp):
-    if not posts.strong_audience(row):
-        save(row["id"], stamp, "held", None, "The moment needs a stronger audience response for automatic posting.")
+def evaluate(row, path, stamp, *, allow_fallback=False):
+    strong_audience = posts.strong_audience(row)
+    if not strong_audience and not allow_fallback:
+        save(row["id"], stamp, "held", None, AUDIENCE_HOLD)
         return
     save(row["id"], stamp, "checking", None, "Checking the opening, payoff, facecam and caption.", 1020)
     try:
@@ -250,7 +252,8 @@ def evaluate(row, path, stamp):
         state, score, reason = interpret(result)
         viral_score = virality.final_score(row, score)
         event = result["reason"] if state == "approved" else ""
-        if state == "approved" and viral_score < virality.MIN_EXPERIMENT_SCORE:
+        fallback = not strong_audience or viral_score < virality.MIN_EXPERIMENT_SCORE
+        if state == "approved" and fallback and not allow_fallback:
             state, reason = "held", VIRALITY_HOLD
         caption, scene, angle = "", "", ""
         if state == "approved":
@@ -278,7 +281,7 @@ def evaluate(row, path, stamp):
         if path.stat().st_mtime_ns == stamp:
             calibration = growth.virality_calibration(event) if state == "approved" else 0
             save(row["id"], stamp, state, score, reason, caption=caption, angle=angle, scene=scene,
-                 viral_score=viral_score, event=event, calibration=calibration)
+                 viral_score=viral_score, event=event, calibration=calibration, fallback=fallback)
     except requests.ConnectionError:
         ct.log("TikTok quality review waiting for Umbrel connection")
         save(row["id"], stamp, "waiting", None, "Umbrel is unreachable. Waiting to reconnect.", CONNECT_RETRY_SECONDS)
@@ -301,20 +304,23 @@ def process_next():
         return False
     allowed, params = ct.creator_filter(ct.creator_profile())
     with closing(ct.db()) as conn:
+        quiet = autopost.hourly_room(conn)["fallback"]
+        permitted = creator_rights.permitted()
         rows = conn.execute(f"""SELECT c.*,v.stamp AS media_stamp,v.state AS viral_state,q.stamp,q.retry_after,
-            ? AS channel FROM clips c
+            ? AS channel, (? AND {permitted}) AS allow_fallback FROM clips c
             JOIN clip_virality v ON v.clip_id=c.id AND v.stamp>0
             LEFT JOIN post_drafts p ON p.clip_id=c.id LEFT JOIN tiktok_uploads u ON u.clip_id=c.id
             LEFT JOIN clip_quality q ON q.clip_id=c.id
             WHERE {allowed} AND c.posted IS NULL AND c.file<>'' AND (p.reserved_day IS NULL OR p.reserved_day<>?)
               AND {autopost.WAITING_UPLOAD} AND NOT {ct.TAKEN_DOWN}
               AND (v.state='preliminary' OR (v.state='held' AND (
-                q.detail=? OR (q.detail=? AND v.score>=? AND v.score<?))))
+                q.detail=? OR (q.detail=? AND v.score>=? AND v.score<?)
+                OR (? AND {permitted} AND q.detail IN (?,?)))))
               AND (q.stamp IS NULL OR q.stamp<>v.stamp OR q.retry_after<=?)
-            ORDER BY ({creator_rights.permitted()}) DESC,v.preliminary DESC,v.audience DESC,c.rowid DESC""",
-                            (settings["channel"], *params, posts.posting_day(), autopost.OLD_MEDIA_ERROR,
+            ORDER BY ({permitted}) DESC,v.preliminary DESC,v.audience DESC,c.rowid DESC""",
+                            (settings["channel"], quiet, *params, posts.posting_day(), autopost.OLD_MEDIA_ERROR,
                              OLD_CAPTION_HOLD, VIRALITY_HOLD, virality.MIN_EXPERIMENT_SCORE, virality.MIN_PUBLISH_SCORE,
-                             time.time())).fetchall()
+                             quiet, AUDIENCE_HOLD, VIRALITY_HOLD, time.time())).fetchall()
     for row in rows:
         try:
             path = (ct.OUT / row["file"]).resolve()
@@ -325,7 +331,7 @@ def process_next():
             continue
         if row["media_stamp"] != stamp:
             continue
-        return evaluate(row, path, stamp) or 0
+        return evaluate(row, path, stamp, allow_fallback=bool(row["allow_fallback"])) or 0
     return 0
 
 

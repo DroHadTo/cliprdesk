@@ -37,6 +37,7 @@ async def lifespan(_):
         yield
     finally:
         stop.set()
+        ct.LIVE.close_recorders()
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 CSRF = secrets.token_urlsafe(32)
@@ -181,12 +182,14 @@ def page(title, body, req=None, *, workspace="gta6"):
     return HTMLResponse(
         f"<!doctype html><html lang=en><head><meta charset=utf-8>"
         f"<meta name=viewport content='width=device-width,initial-scale=1'>"
-        f"<title>{E(title)} &middot; Clip Desk</title><link rel=stylesheet href=/clipdesk.css?v=2>"
+        f"<title>{E(title)} &middot; Clip Desk</title><link rel=stylesheet href=/clipdesk.css?v=3>"
         "<script defer src=/desk.js?v=2></script></head>"
         "<body><a class=skip-link href=#content>Skip to content</a><div class=app-shell>"
         "<aside class=sidebar><a class=brand href=/creators><span class=brand-mark aria-hidden=true></span>Clip Desk</a>"
-        f"<nav aria-label='Workspace'>{nav}</nav></aside><div class=workspace>"
-        f"<header class=windowbar><div><small class=workspace-kicker>Local workspace</small>"
+        f"<nav aria-label='Workspace'>{nav}</nav>"
+        "<div class=sidebar-credit><small>Created by <a href='https://x.com/DroMeta' target=_blank rel=noopener>DroMeta</a></small></div>"
+        "</aside><div class=workspace>"
+        f"<header class=windowbar><div><small class=workspace-kicker>{'Creators' if workspace == 'creators' else 'GTA 6'} workspace</small>"
         f"<h1 class=workspace-heading>{E(title)}</h1></div><div class=stat>"
         f"<span class=pill><span class=dot></span>{st['channels']} Twitch &middot; {st['kick']} Kick</span>"
         f"<span class=pill>{st['recording']} recording</span></div></header>"
@@ -224,6 +227,8 @@ def quality_status(clip, fallback):
     if clip["upload_state"] not in (None, "review"):
         return POST_STATUS.get(clip["upload_state"], fallback), clip["upload_detail"] or ""
     if clip["quality_state"] == "approved":
+        if clip["viral_state"] == "fallback":
+            return "Eligible for quiet-hour posting", clip["quality_detail"] or ""
         if clip["viral_state"] == "verified":
             label = "Eligible for experiment" if clip["viral_score"] < virality.MIN_PUBLISH_SCORE else "Approved for auto-posting"
             return label, clip["quality_detail"] or ""
@@ -237,7 +242,7 @@ def virality_label(clip):
         return "Virality score unavailable · MP4 missing"
     if clip["viral_score"] is None:
         return "Virality score pending" if clip["file"] else ""
-    label = {"verified": "Verified", "held": "Held", "preliminary": "Preliminary"}[state]
+    label = {"verified": "Verified", "fallback": "Quiet-hour fallback", "held": "Held", "preliminary": "Preliminary"}[state]
     return f"Virality {clip['viral_score']}/100 · {label}"
 
 
@@ -440,16 +445,17 @@ def autopost_page(request: Request, connect: bool = False, notice: str = "", err
         api_used, storage_used = autopost.quota_usage(conn)
         eligibility = conn.execute(f"""SELECT count(*) AS library,
             count(*) FILTER (WHERE {creator_rights.permitted()}) AS cleared,
-            count(*) FILTER (WHERE q.state='approved' AND v.state='verified' AND k.caption<>'' AND v.score>=?) AS verified,
             count(*) FILTER (WHERE q.state='approved' AND v.state='verified' AND k.caption<>''
                 AND v.score>=? AND {creator_rights.permitted()}) AS cleared_verified,
+            count(*) FILTER (WHERE q.state='approved' AND v.state='fallback' AND k.caption<>''
+                AND {creator_rights.permitted()}) AS fallback,
             count(*) FILTER (WHERE q.state='held' OR v.state='held') AS held
             FROM clips c
             LEFT JOIN clip_quality q ON q.clip_id=c.id
             LEFT JOIN clip_virality v ON v.clip_id=c.id AND v.stamp=q.stamp
             LEFT JOIN clip_publish_captions k ON k.clip_id=c.id AND k.stamp=q.stamp
             WHERE c.posted IS NULL AND c.file<>'' AND {allowed} AND NOT {ct.TAKEN_DOWN}""",
-            (virality.MIN_EXPERIMENT_SCORE, virality.MIN_EXPERIMENT_SCORE, *params)).fetchone()
+            (virality.MIN_EXPERIMENT_SCORE, *params)).fetchone()
         last = conn.execute("""SELECT max(c.posted) FROM clips c JOIN tiktok_uploads u ON u.clip_id=c.id
             WHERE u.state='sent' AND u.channel=?""", (settings["channel"] if settings else "",)).fetchone()[0]
         jobs = conn.execute(f"""SELECT u.clip_id,u.state,u.detail,c.hook,c.streamer,t.mode,t.score FROM tiktok_uploads u
@@ -467,7 +473,8 @@ def autopost_page(request: Request, connect: bool = False, notice: str = "", err
                        f"<form method=post action='/autopost/resolve/{cid}'>"
                        "<label><input type=checkbox name=confirm_absent value=true required> I checked Buffer and TikTok and cleared any pending post for this video.</label> "
                        "<button>Release for manual upload</button></form></div>")
-        label = f" · Experiment {job['score']}/100" if job["mode"] == "experiment" else ""
+        mode_label = {"experiment": "Experiment", "fallback": "Quiet-hour fallback"}.get(job["mode"])
+        label = f" · {mode_label} {job['score']}/100" if mode_label else ""
         recent.append(f"<li class=panel><a href='/review/{cid}#tiktok'>{E(job['hook'])} · {E(job['streamer'])}{label}</a>"
                       f"<p>{E(POST_STATUS.get(job['state'], 'Posted'))} {E(job['detail'])}</p>{resolve}</li>")
     activity = f"<ul class=post-queue>{''.join(recent)}</ul>" if recent else "<p>No automatic uploads yet.</p>"
@@ -477,19 +484,23 @@ def autopost_page(request: Request, connect: bool = False, notice: str = "", err
     if enabled and eligibility["library"] and not eligibility["cleared"]:
         feedback += ("<p role=status>Auto posting is on. No unposted clips have a publishing grant. "
                      "<a href=/rights>Record permission</a> for footage you can publish.</p>")
-    elif enabled and not eligibility["cleared_verified"]:
+    elif enabled and not (eligibility["cleared_verified"] or eligibility["fallback"]):
         feedback += ("<p role=status>No clips with a publishing grant have passed the video and caption checks yet. "
                      "<a href=/posts>Review the TikTok queue</a>.</p>")
-    pipeline = (f"<p>{eligibility['library']} unposted clips · {eligibility['cleared']} with permission · "
-                f"{eligibility['verified']} passed quality and score · {eligibility['held']} held by review.</p>"
+    pipeline = (f"<dl class=queue-metrics><div><dt>In library</dt><dd>{eligibility['library']}</dd></div>"
+                f"<div><dt>With permission</dt><dd>{eligibility['cleared']}</dd></div>"
+                f"<div><dt>Priority ready</dt><dd>{eligibility['cleared_verified']}</dd></div>"
+                f"<div><dt>Quiet-hour ready</dt><dd>{eligibility['fallback']}</dd></div></dl>"
+                f"<p>{eligibility['held']} held by review.</p>"
                 f"<p>Last confirmed automatic post {E(last or 'awaiting first post')}.</p>")
     if settings:
         controls += "<form method=post action=/autopost/verify><button class=ghost>Verify linked TikTok channel</button></form>"
-    return page("Automatic TikTok posting", f"<h2>Automatic TikTok posting</h2><section class=panel><h3>{status}</h3>"
-                f"{feedback}{pipeline}<p>Only clips with a strong opening, clear payoff, visible creator facecam and strong audience response can publish automatically.</p>"
+    return page("Automatic TikTok posting", f"<section class=panel><h2 class=section-title>{status}</h2>"
+                f"{feedback}{pipeline}<p>Every automatic clip needs a verified opening, payoff, visible facecam and original caption.</p>"
                 f"<p>The publisher ranks verified clips across your full library. Regular posts need {virality.MIN_PUBLISH_SCORE}/100. "
-                f"Experimental posts test scores of {virality.MIN_EXPERIMENT_SCORE}–{virality.MIN_PUBLISH_SCORE - 1}.</p>"
-                f"<p>{hourly}/{posts.HOURLY_LIMIT} regular and {experiments}/{posts.EXPERIMENT_HOURLY_LIMIT} experimental posts in the last hour "
+                f"Experiments test scores of {virality.MIN_EXPERIMENT_SCORE}–{virality.MIN_PUBLISH_SCORE - 1}. "
+                "If the past 60 minutes are empty and those queues have no eligible clip, the highest-scoring fallback can use a regular slot.</p>"
+                f"<p>{hourly}/{posts.HOURLY_LIMIT} regular slots and {experiments}/{posts.EXPERIMENT_HOURLY_LIMIT} experimental slots used in the last hour "
                 f"· up to {posts.DAILY_LIMIT} total per SAST day.</p>"
                 f"<p>30-day clipper usage · {api_used:,}/{autopost.BUFFER_REQUEST_LIMIT:,} Buffer requests · "
                 f"{storage_used / 1e9:.2f}/{autopost.R2_MONTH_BYTES / 1e9:.0f} GB staged in R2.</p>"
@@ -603,7 +614,7 @@ def live_clip(channel: str = Form(max_length=48), length: int = Form(0), workspa
             params = {"notice": ct.LIVE.clip_moment(channel, clicked, length, workspace=workspace)}
         except (ValueError, OSError) as exc:
             ct.log("moment request", channel, type(exc).__name__)
-            params = {"error": str(exc) if isinstance(exc, ValueError) else "Could not start the buffer. Check Streamlink and FFmpeg."}
+            params = {"error": str(exc) if isinstance(exc, ValueError) else "Windows could not open the live buffer. Check available disk space and try again."}
     dest = "/creators" if workspace == "creators" else "/live"
     return RedirectResponse(dest + "?" + urlencode(params), 303)
 
@@ -1148,7 +1159,8 @@ def learning(request: Request, notice: str = "", error: str = ""):
     for name, result in trials.items():
         median_views = f"{result['median']:,.0f}" if result["median"] is not None else "—"
         beats = f"{result['beat_forecast']}/{result['forecasts']}" if result["forecasts"] else "—"
-        trial_rows.append(f"<tr><td>{E(name.capitalize())}</td><td>{result['samples']}</td><td>{median_views}</td>"
+        label = "Quiet-hour fallback" if name == "fallback" else name.capitalize()
+        trial_rows.append(f"<tr><td>{E(label)}</td><td>{result['samples']}</td><td>{median_views}</td>"
                           f"<td>{result['hits']}/{result['samples']}</td><td>{beats}</td></tr>")
     scoring_trials = ("<div class=growth-scroll><table><tr><th>Post type</th><th>Measured</th><th>Median day-three views</th>"
                       f"<th>Reached milestone</th><th>Beat prior score-band median</th></tr>{''.join(trial_rows)}</table></div>")

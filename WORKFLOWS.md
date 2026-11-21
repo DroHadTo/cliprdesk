@@ -1,0 +1,52 @@
+# Clip Desk workflows
+
+## How clips are found
+1. **LIVE (main source)**: every 60s it asks Twitch Helix for live GTA streams (top 20 plus your Include list). It joins their chats anonymously (justinfan, read-only) and scores messages in 10s buckets. KEKW, LUL, OMEGALUL, Pog and "clip it" count extra. A bucket well above the rolling 5-minute baseline counts as a spike.
+   - Include-list streamers (up to `RECORD_MAX`) are **recorded with Streamlink into a 3-minute rolling buffer** from when they go live. Automatic captures use 45, 60 and 75 seconds and start up to eight seconds before the chat spike so the action lands near the opening.
+   - Other streams use the best Twitch clip made around the spike, or failing that the VOD segment.
+   - Spikes need to **hold** for a second 10s bucket, so a single emote wave doesn't fire. Raids, sub-gift and announcement bursts are muted for 45s. Each channel has its own baseline, with a 90s debounce.
+   - **Kick**: streamers on the Kick watchlist are checked every 60s. When one is live in GTA, its chat is read from Kick's realtime chat socket (Centrifugo, guest token; Kick moved off Pusher in Oct 2026) and the stream is recorded with Streamlink. The same spike, cut and edit pipeline then runs.
+   - **Swap test**: if a clip has fewer than 15 spoken words and chat isn't laughing, it's marked "Generic?". Automatic posting prioritizes clips with clearer reaction signals.
+2. **VOD chat spikes**: paste a VOD link on the Today tab, or run `python cliptool.py vod <link> 5`. It uses TwitchDownloader to fetch the chat JSON, applies the same spike logic, and cuts the top moments in a mix of lengths.
+3. **Daily top clips (backfill)**: every 3h it pulls the most-viewed GTA clips from the last 24h, one per streamer, until there are 10 or more streamers for the day. It uses the source VOD to extend a highlight where possible. Short sources can produce shorter videos.
+4. In Live now, choose **Mix lengths** or select 45, 60 or 75 seconds next to **Clip moment**. Click **Start buffer** before watching a streamer who is not already recording. The longest clip needs about 50 seconds of lead-in. Captures appear in Today and use the same editing and posting queue.
+
+## Edit
+The video is 1080x1920 H.264/AAC, up to 75 seconds. **GTA VI** sits at the top, with the footage in the middle and spoken captions and streamer credit below. The edit styles change how the footage and facecam are framed. **Apply GTA VI layout** is available in Review for an older unposted draft with its original footage and trim points. The worker also applies the layout when preparing an eligible saved draft for upload. Encoding uses a pool of two jobs. Transcripts are cached by audio hash and come from local faster-whisper.
+
+## Automatic TikTok posting
+
+1. [Connect your TikTok account in Buffer](https://publish.buffer.com/settings/channels). [Create a personal Buffer API key](https://publish.buffer.com/settings/api) with permissions to read channels and read and write posts.
+2. [Create a dedicated Cloudflare R2 staging bucket](https://developers.cloudflare.com/r2/get-started/) and [an Object Read & Write key for that bucket](https://developers.cloudflare.com/r2/api/tokens/). Set up a [public delivery URL](https://developers.cloudflare.com/r2/buckets/public-buckets/) for Buffer to read the staged videos.
+3. In the local clip desk, open **TikTok → Automatic posting settings**. Save the Buffer API key, R2 account ID, bucket name, R2 access keys and public delivery URL under **Setup → Buffer and Cloudflare R2**. Return to **Automatic posting settings**, find the TikTok channel, and click **Enable automatic posting**.
+
+Keep the clipper and Umbrel running. Every saved video receives a preliminary virality score based on the source audience response, creator facecam and available transcript. The worker reviews the highest-scoring eligible clips across the full saved library, including older clips by approved creators.
+
+Umbrel scores the finished footage for the opening, payoff and clarity, verifies that a creator facecam is visible, then independently checks the highlight and writes a caption grounded in it. Regular posts require 86/100, weighted 80% toward footage and 20% toward audience response. Both posting modes require a chat spike at least 2.5 times the stream baseline with at least three reaction messages, or a top Twitch clip with at least 1,000 source views. The publisher checks for repeated captions and overlapping moments, then adds two relevant hashtags.
+
+The worker uses faster-whisper for timed dialogue, UltraFace for the creator crop, and FFmpeg for the vertical cut, styled subtitles, audio leveling and H.264 export. It creates preview titles from the source and saves Umbrel's per-clip writing for footage that passes review. By default it exports one format and makes the other formats available in Review through **Trim and re-render**. Set `RENDER_ALL_VARIANTS=true` to export the alternatives at capture time.
+
+In **Review**, **Download edit package** supplies the selected MP4, available source footage, trim metadata, available transcript and subtitles, and an Editly project. See [the media pipeline](MEDIA-TOOLS.md) for VOD import and the tools that can use those assets.
+
+The worker can publish three regular clips and one experimental clip in any rolling hour. Experiments use verified scores of 82–85 with the same opening, payoff, facecam, audience and caption checks. Both kinds share 50 slots per South African calendar day with manual reservations. The worker pauses before exhausting its [Buffer API allowance](https://developers.buffer.com/guides/api-limits.html) or its [R2 Standard storage budget](https://developers.cloudflare.com/r2/pricing/). It verifies each temporary R2 video, removes it after the upload resolves, and records the post when Buffer confirms publication. Check recent uploads and usage under **Automatic posting settings**. If a post needs confirmation, use **Recheck Buffer** or clear it from Buffer before releasing the clip for a manual upload.
+
+When the footage passes but the caption fails, the worker drafts up to three alternatives from the verified scene. It uses the first caption that passes the scene and originality checks. Clips that still fail remain in review while the worker looks at the next candidate. Check **Automatic posting settings** for permissions, quality and ready-to-publish counts.
+
+Select **Post to TikTok** to reserve a slot, copy the caption, download the MP4 and publish in [TikTok Studio](https://www.tiktok.com/tiktokstudio/upload). Choose **Mark posted** when published or **Release unused slot** to give the slot back.
+
+## TikTok growth
+
+**Learning** uses Buffer's Insights Read permission to sync the connected channel's published videos about every six hours. Milestones start at 1,000 views and build to 1 million per post. Each post is measured at its first snapshot between 72 and 96 hours after publication. A milestone is recorded when at least 60% of the latest ten measured posts in the last 30 days reach it, with a minimum of five comparable posts. The clipper compares cut style, length, caption angle and verified moment type on the current target. If a moment type consistently leads, it gets a small ranking boost among clips that already qualify.
+
+TikTok's public guidance, checked on 21 November 2026, informs the review and the Umbrel learning brief. For You considers interactions including watch time, skipping, finishing and sharing. Search considers how closely the content matches the query. Use specific descriptions and test openings against actual account results. [TikTok recommendations guide](https://support.tiktok.com/en/using-tiktok/exploring-videos/how-tiktok-recommends-content)
+
+Every automatic submission stores its score, moment type, and regular or experimental assignment. Once five earlier posts in the same score band have a comparable day-three snapshot, the worker records their median views as a baseline for the new post. **Learning** compares experimental and regular results at the same age. When enough comparable posts in a moment type perform differently, future clips of that type can move by up to three points in the queue ranking.
+
+Public research refreshes daily through the available provider connections. Public YouTube feeds supply GTA VI listings from Rockstar Games and MKIceAndFire without credentials. Twitch supplies recent GTA VI clip rankings through Helix. TikTok requires approved Business Discovery access. Instagram Reels requires Meta Public Content Access with a professional account, and a YouTube Data API key enables a broader query for short uploads. Configure these connections in **Setup → Public trend research**. Umbrel reviews one available footage sample per day, using local footage or video made available by Meta's API. TikTok rankings supply links and hashtag metrics. When an opening pattern appears across three creators whose footage is available, the worker can test a tighter lead-in on original clips and compare it with standard edits. [TikTok Discovery](https://business-api.tiktok.com/gateway/docs/index?doc_id=1825119056527362) · [Meta Hashtag Search](https://developers.facebook.com/documentation/instagram-platform/instagram-graph-api/reference/ig-hashtag-search) · [YouTube public feeds](https://developers.google.com/youtube/data/guides/push_notifications) · [Twitch Get Clips](https://dev.twitch.tv/docs/api/clips)
+
+The optional [TikTok Discovery API](https://ads.tiktok.com/resources/help/article/marketing-api?lang=en) refreshes ranked videos for currently popular GTA hashtags once a day with approved advertiser credentials saved in Setup. Add public TikTok examples from [Trending Videos](https://ads.tiktok.com/creative/creativeCenter/trends/video) with an observation about the opening. The nightly Umbrel brief uses your channel's real metrics and these references to propose a test. Check eligible views and earnings separately in [Creator Rewards](https://newsroom.tiktok.com/introducing-the-new-creator-rewards-program/?lang=en).
+
+## Run
+`start.bat` opens Today in your browser using the `PORT` in `.env`. When running `python app.py` directly, open `http://127.0.0.1:8788/today` or use your configured port. The CLI: `python cliptool.py backfill|live|vod <id>|nightly|drafts|test-clip <slug> <streamer> <title>|test-local <file> <streamer> <title> [start] [length]`.
+
+See EARNINGS.md for campaign tracking and the local Setup page for connections.

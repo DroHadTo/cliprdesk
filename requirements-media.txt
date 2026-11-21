@@ -1,0 +1,5 @@
+yt-dlp==2026.10.26 --hash=sha256:a05c5b5d8562f7e8a62f5334348b406af4930d56d3a65f8021d14af0e22339ae
+yt-dlp-ejs==0.8.0 --hash=sha256:79300e5fca7f937a1eeede11f0456862c1b41107ce1d726871e0207424f4bdb4
+pysubs2==1.9.1 --hash=sha256:4210ebedc54e8272e741fc5888a1721f74056bbd91b7aac7cc90b6559cd055b4
+# Optional Windows facecam preprocessing. NumPy is already part of the worker.
+opencv-python-headless==5.1.0.95 --hash=sha256:2fd11ce2e88feb28869ad5762a31546ce0062e7c55c130c425ccd3918a19e4fa
